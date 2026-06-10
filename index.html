@@ -135,7 +135,7 @@ const STATUSES = ["pending", "yes", "maybe", "no", "contacted", "replied", "inte
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const app = $("#app");
-const state = { rows: null, tab: "review", reviewed: 0, search: "", filter: "all", roleFilter: "all", detail: null, pool: null, includePool: false, user: null, roles: [], showRoles: false };
+const state = { rows: null, tab: "review", reviewed: 0, reviewRole: null, search: "", filter: "all", roleFilter: "all", detail: null, pool: null, includePool: false, user: null, roles: [], showRoles: false };
 let supa = null;
 
 const anonKey = () => SUPA_ANON_KEY || localStorage.getItem("sb_anon") || "";
@@ -335,20 +335,71 @@ function renderRoles() {
 }
 
 /* ---------- review tab ---------- */
+function roleTitle(key) {
+  const r = state.roles.find(x => x.key === key);
+  return r ? r.title : key;
+}
+
 function renderReview() {
-  const queue = state.rows
-    .filter(c => c.status === "pending")
-    .sort((a, b) => (a.sourced || "").localeCompare(b.sourced || ""));
-  if (!queue.length) {
+  const pending = state.rows.filter(c => c.status === "pending");
+  // counts of pending per role, in the roles table's order
+  const byRole = state.roles
+    .map(r => ({ key: r.key, title: r.title, n: pending.filter(c => c.role === r.key).length }))
+    .filter(r => r.n > 0);
+  // any pending candidate whose role isn't in the roles list (shouldn't happen, but don't lose them)
+  const orphan = pending.filter(c => !state.roles.some(r => r.key === c.role)).length;
+
+  if (!pending.length) {
     shell(`<div class="empty"><div class="big">${state.reviewed ? "✅" : "📭"}</div>
       <h2>${state.reviewed ? "All done" : "Queue is clear"}</h2>
       <p>${state.reviewed
         ? `${state.reviewed} verdict${state.reviewed > 1 ? "s" : ""} saved — tomorrow's run learns from them.`
         : "No pending candidates. New ones land each morning."}</p></div>`);
+    state.reviewRole = null;
     return;
   }
+
+  // role picker: shown when more than one role has a pending queue and none is chosen
+  const choices = byRole.length + (orphan ? 1 : 0);
+  if (!state.reviewRole && choices > 1) {
+    shell(`
+      <div class="empty" style="padding:24px 8px 8px">
+        <div class="big">📋</div>
+        <h2>Pick a queue to review</h2>
+        <p>${pending.length} candidates pending. Review one role at a time to stay focused.</p>
+      </div>
+      ${byRole.map(r => `
+        <button class="row" data-rolepick="${esc(r.key)}">
+          <div class="who"><b>${esc(r.title)}</b><span>${r.n} pending</span></div>
+          <span class="pill s-pending">${r.n}</span>
+        </button>`).join("")}
+      ${orphan ? `<button class="row" data-rolepick="__all__">
+          <div class="who"><b>Everything</b><span>review all roles in one stream</span></div>
+          <span class="pill s-pending">${pending.length}</span></button>` : ""}`);
+    $$("[data-rolepick]").forEach(b => b.onclick = () => { state.reviewRole = b.dataset.rolepick; state.reviewed = 0; render(); });
+    return;
+  }
+
+  // if only one role has a queue, just review it (no picker needed)
+  const activeRole = state.reviewRole || (byRole[0] && byRole[0].key) || "__all__";
+  const queue = pending
+    .filter(c => activeRole === "__all__" || c.role === activeRole)
+    .sort((a, b) => (a.sourced || "").localeCompare(b.sourced || ""));
+
+  if (!queue.length) {
+    // finished this role's queue; bounce back to picker (or done)
+    state.reviewRole = null;
+    return renderReview();
+  }
   const c = queue[0];
-  shell(candidateCard(c, `
+  const roleLabel = activeRole === "__all__" ? "All roles" : roleTitle(activeRole);
+  const switchable = choices > 1;
+  shell(`
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+      <span class="pill s-pending">${esc(roleLabel)}</span>
+      ${switchable ? `<button class="back" id="switch" style="margin:0">⇄ switch queue</button>` : ""}
+    </div>` +
+    candidateCard(c, `
       <div class="section"><div class="label">Note (optional — this trains the agent)</div>
         <div class="chips">${CHIPS.map(t => `<button class="chip" data-t="${esc(t)}">${esc(t)}</button>`).join("")}</div>
         <textarea id="note" placeholder="why yes / why no…"></textarea>
@@ -358,7 +409,8 @@ function renderReview() {
         <button class="b-maybe" data-v="maybe">🤔</button>
         <button class="b-yes" data-v="yes">👍 Yes</button>
       </div>`) +
-    `<div class="progress">${state.reviewed + 1} of ${state.reviewed + queue.length} · ${queue.length} pending</div>`);
+    `<div class="progress">${esc(roleLabel)} · ${state.reviewed + 1} of ${state.reviewed + queue.length} · ${queue.length} left in this queue</div>`);
+  if (switchable) $("#switch").onclick = () => { state.reviewRole = null; state.reviewed = 0; render(); };
   $$(".chip").forEach(ch => ch.onclick = () => {
     ch.classList.toggle("on");
     const on = $$(".chip.on").map(x => x.dataset.t);
