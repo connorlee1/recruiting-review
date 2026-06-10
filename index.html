@@ -119,18 +119,16 @@
 <div class="toast" id="toast"></div>
 
 <script>
-const DEFAULT_REPO = "connorlee1/recruiting-agent";
-const DB_PATH = "candidates/db.json";
 const CHIPS = ["too junior", "too senior", "wrong subfield", "weak evidence", "not recruitable", "strong fit", "reach out fast"];
 const STATUSES = ["pending", "yes", "maybe", "no", "contacted", "replied", "interviewing", "offer", "hired", "archived"];
 
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const app = $("#app");
-const state = { db: null, tab: "review", reviewed: 0, search: "", filter: "all", detail: null, pool: null, includePool: false };
+const state = { rows: null, tab: "review", reviewed: 0, search: "", filter: "all", detail: null, pool: null, includePool: false };
 
-const token = () => localStorage.getItem("rr_token") || "";
-const repo  = () => localStorage.getItem("rr_repo") || DEFAULT_REPO;
+const sbUrl = () => (localStorage.getItem("sb_url") || "").replace(/\/+$/, "");
+const sbKey = () => localStorage.getItem("sb_key") || "";
 
 function toast(msg) {
   const t = $("#toast"); t.textContent = msg; t.classList.add("show");
@@ -139,73 +137,34 @@ function toast(msg) {
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
 }
-const b64decode = s => decodeURIComponent(escape(atob(s.replace(/\s/g, ""))));
-const b64encode = s => btoa(unescape(encodeURIComponent(s)));
 const today = () => new Date().toISOString().slice(0, 10);
 
-async function gh(path, opts = {}) {
-  const res = await fetch(`https://api.github.com/repos/${repo()}/${path}`, {
+/* ---------- supabase (PostgREST) ---------- */
+async function sb(path, opts = {}) {
+  const res = await fetch(`${sbUrl()}/rest/v1/${path}`, {
     ...opts,
     headers: {
-      "Authorization": `Bearer ${token()}`,
-      "Accept": "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      ...(opts.body ? { "Content-Type": "application/json" } : {}),
+      "apikey": sbKey(),
+      "Authorization": `Bearer ${sbKey()}`,
+      ...(opts.body ? { "Content-Type": "application/json", "Prefer": "return=minimal" } : {}),
+      ...(opts.headers || {}),
     },
   });
-  if (res.status === 401) { renderSetup("Token rejected — paste a valid token."); throw new Error("auth"); }
-  return res;
+  if (res.status === 401 || res.status === 403) { renderSetup("Key rejected — paste the service_role key."); throw new Error("auth"); }
+  if (!res.ok) throw new Error(`db ${res.status}`);
+  return res.status === 204 ? null : res.json();
 }
+const loadCandidates = () => sb("candidates?select=*&order=sourced.desc,id.desc");
+const loadPool = () => sb("pool?select=*&order=evaluated.desc,id.desc");
 
-async function fetchDb() {
-  const r = await gh(`contents/${DB_PATH}?ref=main`);
-  if (r.status === 404) return { sha: null, data: { candidates: [] } };
-  if (!r.ok) throw new Error(`db fetch ${r.status}`);
-  const meta = await r.json();
-  return { sha: meta.sha, data: JSON.parse(b64decode(meta.content)) };
-}
-
-// refetch-mutate-commit with one retry on sha conflict
-async function saveDb(mutate, message) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const { sha, data } = await fetchDb();
-    mutate(data);
-    const res = await gh(`contents/${DB_PATH}`, {
-      method: "PUT",
-      body: JSON.stringify({
-        message,
-        content: b64encode(JSON.stringify(data, null, 2) + "\n"),
-        ...(sha ? { sha } : {}),
-        branch: "main",
-      }),
-    });
-    if (res.ok) { state.db = data; return; }
-    if (res.status !== 409 && res.status !== 422) throw new Error(`commit ${res.status}`);
-  }
-  throw new Error("conflict");
-}
-
-async function fetchPool() {
-  const r = await gh("contents/candidates/pool?ref=main");
-  if (!r.ok) return [];
-  const files = (await r.json()).filter(f => f.name.endsWith(".json"));
-  const all = [];
-  for (const f of files) {
-    try {
-      const fr = await gh(`contents/candidates/pool/${f.name}?ref=main`);
-      if (!fr.ok) continue;
-      const d = JSON.parse(b64decode((await fr.json()).content));
-      all.push(...(d.evaluated || []));
-    } catch (e) { /* malformed shard — skip */ }
-  }
-  return all;
-}
-
-function applyFeedback(c, status, noteText) {
-  c.status = status;
-  c.status_updated = new Date().toISOString();
-  if (noteText) (c.notes = c.notes || []).push({ date: today(), text: noteText });
-  c.feedback_pending = true;
+async function pushFeedback(c, status, noteText) {
+  const notes = [...(c.notes || [])];
+  if (noteText) notes.push({ date: today(), text: noteText });
+  await sb(`candidates?id=eq.${encodeURIComponent(c.id)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ status, notes, status_updated: new Date().toISOString(), feedback_pending: true }),
+  });
+  c.status = status; c.notes = notes; c.feedback_pending = true;
 }
 
 /* ---------- setup ---------- */
@@ -213,31 +172,31 @@ function renderSetup(err = "") {
   app.innerHTML = `
     <header><h1>Anthrogen Talent</h1></header>
     <div class="card setup">
-      <p style="font-size:14px;color:var(--dim)">Connects straight to your private GitHub repo. The token is stored only on this device.</p>
-      <label>Fine-grained GitHub token (Contents: read &amp; write on the repo below)</label>
-      <input id="tok" type="password" placeholder="github_pat_…" value="${esc(token())}" autocomplete="off">
-      <label>Repository</label>
-      <input id="rep" type="text" value="${esc(repo())}" autocomplete="off">
+      <p style="font-size:14px;color:var(--dim)">Connects straight to your Supabase project. Credentials are stored only on this device.</p>
+      <label>Supabase project URL</label>
+      <input id="url" type="text" placeholder="https://xxxx.supabase.co" value="${esc(sbUrl())}" autocomplete="off">
+      <label>Service role key</label>
+      <input id="key" type="password" placeholder="eyJ… (Project Settings → API keys)" value="${esc(sbKey())}" autocomplete="off">
       <button class="save" id="save">Connect</button>
       <div class="err">${esc(err)}</div>
-      <p class="hint">Create one at <a href="https://github.com/settings/personal-access-tokens/new" target="_blank">github.com → fine-grained tokens</a>: Repository access → only your recruiting repo; Permissions → Contents: Read and write.</p>
+      <p class="hint">From <a href="https://supabase.com/dashboard" target="_blank">supabase.com/dashboard</a> → your project → Project Settings → API: copy the Project URL and the <b>service_role</b> secret key. Only use this app on your own devices.</p>
     </div>`;
   $("#save").onclick = async () => {
-    localStorage.setItem("rr_token", $("#tok").value.trim());
-    localStorage.setItem("rr_repo", $("#rep").value.trim() || DEFAULT_REPO);
-    if ((await gh("")).ok) { toast("Connected"); boot(); }
-    else renderSetup("Can't reach that repo with this token.");
+    localStorage.setItem("sb_url", $("#url").value.trim().replace(/\/+$/, ""));
+    localStorage.setItem("sb_key", $("#key").value.trim());
+    try { await sb("candidates?select=id&limit=1"); toast("Connected"); boot(); }
+    catch (e) { if (e.message !== "auth") renderSetup("Can't reach that project — check URL and key, and that schema.sql has been run."); }
   };
 }
 
 /* ---------- shell ---------- */
 function shell(inner) {
-  const pending = state.db.candidates.filter(c => c.status === "pending").length;
+  const pending = state.rows.filter(c => c.status === "pending").length;
   app.innerHTML = `
     <header><h1>Anthrogen Talent</h1><button class="gear" id="gear">⚙︎</button></header>
     <div class="tabs">
       <button id="t-review" class="${state.tab === "review" ? "on" : ""}">Review ${pending ? `<span class="count">${pending}</span>` : ""}</button>
-      <button id="t-talent" class="${state.tab === "talent" ? "on" : ""}">Talent <span class="count" style="color:var(--dim)">${state.db.candidates.length}</span></button>
+      <button id="t-talent" class="${state.tab === "talent" ? "on" : ""}">Talent <span class="count" style="color:var(--dim)">${state.rows.length}</span></button>
     </div>
     <div id="body">${inner}</div>`;
   $("#gear").onclick = () => renderSetup();
@@ -262,14 +221,14 @@ function candidateCard(c, extra = "") {
 
 /* ---------- review tab ---------- */
 function renderReview() {
-  const queue = state.db.candidates
+  const queue = state.rows
     .filter(c => c.status === "pending")
     .sort((a, b) => (a.sourced || "").localeCompare(b.sourced || ""));
   if (!queue.length) {
     shell(`<div class="empty"><div class="big">${state.reviewed ? "✅" : "📭"}</div>
       <h2>${state.reviewed ? "All done" : "Queue is clear"}</h2>
       <p>${state.reviewed
-        ? `${state.reviewed} verdict${state.reviewed > 1 ? "s" : ""} committed — tomorrow's run learns from them.`
+        ? `${state.reviewed} verdict${state.reviewed > 1 ? "s" : ""} saved — tomorrow's run learns from them.`
         : "No pending candidates. New ones land each morning."}</p></div>`);
     return;
   }
@@ -293,19 +252,13 @@ function renderReview() {
   });
   $$(".actions button").forEach(b => b.onclick = async () => {
     $$(".actions button").forEach(x => x.disabled = true);
-    const note = $("#note").value.trim();
     try {
-      await saveDb(d => {
-        const t = (d.candidates || []).find(x => x.id === c.id);
-        if (!t) throw new Error("id missing");
-        applyFeedback(t, b.dataset.v, note);
-      }, `verdict: ${c.name} → ${b.dataset.v}`);
+      await pushFeedback(c, b.dataset.v, $("#note").value.trim());
       state.reviewed++;
       toast(`${c.name.split(" ")[0]} → ${b.dataset.v}`);
       render();
     } catch (e) {
-      toast("Commit failed — try again");
-      $$(".actions button").forEach(x => x.disabled = false);
+      if (e.message !== "auth") { toast("Save failed — try again"); $$(".actions button").forEach(x => x.disabled = false); }
     }
   });
 }
@@ -314,8 +267,8 @@ function renderReview() {
 function renderTalent() {
   if (state.detail) return renderDetail();
   const q = state.search.toLowerCase();
-  const present = [...new Set(state.db.candidates.map(c => c.status))];
-  const list = state.db.candidates
+  const present = [...new Set(state.rows.map(c => c.status))];
+  const list = state.rows
     .filter(c => state.filter === "all" || c.status === state.filter)
     .filter(c => !q || [c.name, c.affiliation, c.why, c.recruitability,
         ...(c.notes || []).map(n => n.text), ...(c.evidence || []).map(e => e.label)]
@@ -327,7 +280,6 @@ function renderTalent() {
       .map((p, i) => ({ p, i }))
       .filter(({ p }) => !q || [p.name, p.affiliation, p.assessment, p.tier, p.channel]
         .join(" ").toLowerCase().includes(q))
-      .sort((a, b) => (b.p.evaluated || "").localeCompare(a.p.evaluated || ""))
       .map(({ p, i }) => `
         <button class="row" data-pool="${i}" style="opacity:.78">
           <div class="who"><b>${esc(p.name)} <span style="color:var(--dim);font-size:12px">${esc(p.role || "")}</span></b>
@@ -350,13 +302,13 @@ function renderTalent() {
       </button>`).join("")}
     ${poolRows}
     ${(list.length || poolRows) ? "" :
-      `<div class="empty"><div class="big">🔍</div><h2>No matches</h2><p>${state.db.candidates.length ? "Try a different search or filter." : "The database fills up as the agent runs each morning."}</p></div>`}`);
+      `<div class="empty"><div class="big">🔍</div><h2>No matches</h2><p>${state.rows.length ? "Try a different search or filter." : "The database fills up as the agent runs each morning."}</p></div>`}`);
   $("#q").oninput = e => { state.search = e.target.value; render(); const i = $("#q"); i.focus(); i.setSelectionRange(i.value.length, i.value.length); };
   $$(".filters .chip[data-s]").forEach(b => b.onclick = () => { state.filter = b.dataset.s; render(); });
   $("#poolchip").onclick = async () => {
     if (!state.pool) {
       $("#poolchip").textContent = "loading…";
-      try { state.pool = await fetchPool(); } catch (e) { toast("Couldn't load pool"); return; }
+      try { state.pool = await loadPool(); } catch (e) { if (e.message !== "auth") toast("Couldn't load pool"); return; }
     }
     state.includePool = !state.includePool;
     render();
@@ -382,26 +334,25 @@ function renderPoolDetail(p) {
   $("#promote").onclick = async () => {
     $("#promote").disabled = true;
     try {
-      await saveDb(d => {
-        if ((d.candidates || []).some(c => c.name.toLowerCase() === p.name.toLowerCase())) throw new Error("already in pipeline");
-        d.candidates.push({
-          id: `${today()}-promoted-${d.candidates.length + 1}`,
-          name: p.name, role: p.role === "MLE" ? "MLE" : "RS",
-          affiliation: p.affiliation || "",
-          why: `Promoted from pool by Connor. Agent's original assessment (${p.evaluated}, ${p.tier}): ${p.assessment}`,
-          evidence: (p.links || []).map(u => ({ label: u, url: u })),
-          recruitability: "unknown — promoted from pool",
-          watch_out: "pool record: needs re-verification",
-          sourced: today(), status: "pending", status_updated: null,
-          notes: [{ date: today(), text: "promoted from evaluation pool" }],
-          feedback_pending: true,
-        });
-      }, `promote from pool: ${p.name}`);
+      if (state.rows.some(c => c.name.toLowerCase() === p.name.toLowerCase())) { toast("Already in pipeline"); return; }
+      const rec = {
+        id: `${today()}-promoted-${crypto.randomUUID().slice(0, 8)}`,
+        name: p.name, role: p.role === "MLE" ? "MLE" : "RS",
+        affiliation: p.affiliation || "",
+        why: `Promoted from pool by Connor. Agent's original assessment (${p.evaluated}, ${p.tier}): ${p.assessment}`,
+        evidence: (p.links || []).map(u => ({ label: u, url: u })),
+        recruitability: "unknown — promoted from pool",
+        watch_out: "pool record: needs re-verification",
+        sourced: today(), status: "pending",
+        notes: [{ date: today(), text: "promoted from evaluation pool" }],
+        feedback_pending: true,
+      };
+      await sb("candidates", { method: "POST", body: JSON.stringify([rec]) });
+      state.rows.unshift(rec);
       toast(`${p.name.split(" ")[0]} added to pipeline`);
       state.detail = null; render();
     } catch (e) {
-      toast(e.message === "already in pipeline" ? "Already in pipeline" : "Commit failed — try again");
-      $("#promote").disabled = false;
+      if (e.message !== "auth") { toast("Save failed — try again"); $("#promote").disabled = false; }
     }
   };
 }
@@ -412,7 +363,7 @@ function renderDetail() {
     if (!p) { state.detail = null; return render(); }
     return renderPoolDetail(p);
   }
-  const c = state.db.candidates.find(x => x.id === state.detail);
+  const c = state.rows.find(x => x.id === state.detail);
   if (!c) { state.detail = null; return render(); }
   shell(`
     <button class="back" id="back">← Talent</button>
@@ -431,14 +382,10 @@ function renderDetail() {
     const status = $("#status").value, note = $("#newnote").value.trim();
     if (status === c.status && !note) { state.detail = null; return render(); }
     try {
-      await saveDb(d => {
-        const t = (d.candidates || []).find(x => x.id === c.id);
-        if (!t) throw new Error("id missing");
-        if (status !== t.status || note) applyFeedback(t, status, note);
-      }, `update: ${c.name} → ${status}`);
+      await pushFeedback(c, status, note);
       toast("Saved");
       render();
-    } catch (e) { toast("Commit failed — try again"); $("#save").disabled = false; }
+    } catch (e) { if (e.message !== "auth") { toast("Save failed — try again"); $("#save").disabled = false; } }
   };
 }
 
@@ -446,14 +393,13 @@ function renderDetail() {
 function render() { state.tab === "review" ? renderReview() : renderTalent(); }
 
 async function boot() {
-  if (!token()) return renderSetup();
+  if (!sbUrl() || !sbKey()) return renderSetup();
   app.innerHTML = `<div class="spin">Loading talent database…</div>`;
   try {
-    const { data } = await fetchDb();
-    state.db = data;
+    state.rows = await loadCandidates();
     render();
   } catch (e) {
-    if (e.message !== "auth") renderSetup("Couldn't load the database — check token & repo.");
+    if (e.message !== "auth") renderSetup("Couldn't load the database — check URL, key, and that schema.sql has been run.");
   }
 }
 boot();
