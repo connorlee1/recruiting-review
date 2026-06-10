@@ -59,7 +59,7 @@
     font-size: 13px; padding: 5px 10px; border-radius: 999px;
   }
   .chip.on { color: var(--text); border-color: var(--accent); }
-  textarea, input[type=text], input[type=password], input[type=search], select {
+  textarea, input, select {
     width: 100%; background: var(--card2); border: 1px solid var(--border); color: var(--text);
     border-radius: 10px; padding: 10px 12px; font: inherit; font-size: 15px;
   }
@@ -102,9 +102,11 @@
 
   .setup label { display: block; font-size: 13px; color: var(--dim); margin: 14px 0 4px; }
   .setup .save { width: 100%; margin-top: 18px; padding: 14px; background: var(--accent); color: #04121f; font-weight: 700; font-size: 16px; }
+  .setup .alt { width: 100%; margin-top: 10px; padding: 12px; border: 1px solid var(--border); color: var(--dim); }
   .setup .hint { font-size: 13px; color: var(--dim); margin-top: 14px; }
   .setup .hint a { color: var(--accent); }
   .err { color: #ff7b72; font-size: 14px; margin-top: 10px; min-height: 20px; }
+  .ok { color: #3fb950; font-size: 14px; margin-top: 10px; min-height: 20px; }
   .toast {
     position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
     background: #2d333b; color: var(--text); padding: 10px 18px; border-radius: 999px;
@@ -112,23 +114,31 @@
   }
   .toast.show { opacity: 1; }
   .spin { text-align: center; padding: 60px 0; color: var(--dim); }
+  .menu { position: absolute; right: 16px; top: 52px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 8px; z-index: 5; min-width: 220px; }
+  .menu .who { color: var(--dim); font-size: 13px; padding: 6px 10px; border-bottom: 1px solid var(--border); margin-bottom: 6px; }
+  .menu button { display: block; width: 100%; text-align: left; padding: 8px 10px; font-size: 14px; }
+  .menu button:hover { background: var(--card2); }
 </style>
 </head>
 <body>
 <div class="wrap" id="app"><div class="spin">Loading…</div></div>
 <div class="toast" id="toast"></div>
 
-<script>
+<script type="module">
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const SUPA_URL = "https://iqzfpguwwdxmefnopsay.supabase.co";
+const SUPA_ANON_KEY = "";   // optional hardcode; falls back to localStorage
 const CHIPS = ["too junior", "too senior", "wrong subfield", "weak evidence", "not recruitable", "strong fit", "reach out fast"];
 const STATUSES = ["pending", "yes", "maybe", "no", "contacted", "replied", "interviewing", "offer", "hired", "archived"];
 
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const app = $("#app");
-const state = { rows: null, tab: "review", reviewed: 0, search: "", filter: "all", detail: null, pool: null, includePool: false };
+const state = { rows: null, tab: "review", reviewed: 0, search: "", filter: "all", detail: null, pool: null, includePool: false, user: null };
+let supa = null;
 
-const sbUrl = () => (localStorage.getItem("sb_url") || "").replace(/\/+$/, "");
-const sbKey = () => localStorage.getItem("sb_key") || "";
+const anonKey = () => SUPA_ANON_KEY || localStorage.getItem("sb_anon") || "";
 
 function toast(msg) {
   const t = $("#toast"); t.textContent = msg; t.classList.add("show");
@@ -138,55 +148,89 @@ function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
 }
 const today = () => new Date().toISOString().slice(0, 10);
+function unwrap({ data, error }) { if (error) throw error; return data; }
 
-/* ---------- supabase (PostgREST) ---------- */
-async function sb(path, opts = {}) {
-  const res = await fetch(`${sbUrl()}/rest/v1/${path}`, {
-    ...opts,
-    headers: {
-      "apikey": sbKey(),
-      "Authorization": `Bearer ${sbKey()}`,
-      ...(opts.body ? { "Content-Type": "application/json", "Prefer": "return=minimal" } : {}),
-      ...(opts.headers || {}),
-    },
-  });
-  if (res.status === 401 || res.status === 403) { renderSetup("Key rejected — paste the service_role key."); throw new Error("auth"); }
-  if (!res.ok) throw new Error(`db ${res.status}`);
-  return res.status === 204 ? null : res.json();
-}
-const loadCandidates = () => sb("candidates?select=*&order=sourced.desc,id.desc");
-const loadPool = () => sb("pool?select=*&order=evaluated.desc,id.desc");
+/* ---------- data ---------- */
+const loadCandidates = async () => unwrap(
+  await supa.from("candidates")
+    .select("*, notes(*)")
+    .order("sourced", { ascending: false }).order("id", { ascending: false })
+    .order("created_at", { referencedTable: "notes", ascending: true })
+    .limit(1000));
+const loadPool = async () => unwrap(
+  await supa.from("pool").select("*")
+    .order("evaluated", { ascending: false }).limit(2000));
 
 async function pushFeedback(c, status, noteText) {
-  const notes = [...(c.notes || [])];
-  if (noteText) notes.push({ date: today(), text: noteText });
-  await sb(`candidates?id=eq.${encodeURIComponent(c.id)}`, {
-    method: "PATCH",
-    body: JSON.stringify({ status, notes, status_updated: new Date().toISOString(), feedback_pending: true }),
-  });
-  c.status = status; c.notes = notes; c.feedback_pending = true;
+  unwrap(await supa.from("candidates")
+    .update({ status, status_updated: new Date().toISOString(), feedback_pending: true })
+    .eq("id", c.id));
+  c.status = status;
+  if (noteText) {
+    const note = unwrap(await supa.from("notes")
+      .insert({ candidate_id: c.id, author: state.user.email, text: noteText })
+      .select()) [0];
+    (c.notes = c.notes || []).push(note);
+  }
 }
 
-/* ---------- setup ---------- */
-function renderSetup(err = "") {
+/* ---------- one-time key config ---------- */
+function renderKeySetup(err = "") {
   app.innerHTML = `
     <header><h1>Anthrogen Talent</h1></header>
     <div class="card setup">
-      <p style="font-size:14px;color:var(--dim)">Connects straight to your Supabase project. Credentials are stored only on this device.</p>
-      <label>Supabase project URL</label>
-      <input id="url" type="text" placeholder="https://xxxx.supabase.co" value="${esc(sbUrl())}" autocomplete="off">
-      <label>Service role key</label>
-      <input id="key" type="password" placeholder="eyJ… (Project Settings → API keys)" value="${esc(sbKey())}" autocomplete="off">
-      <button class="save" id="save">Connect</button>
+      <p style="font-size:14px;color:var(--dim)">One-time setup on this device.</p>
+      <label>Supabase publishable (anon) key</label>
+      <input id="key" type="password" placeholder="sb_publishable_… or eyJ…" value="${esc(localStorage.getItem("sb_anon") || "")}" autocomplete="off">
+      <button class="save" id="save">Save</button>
       <div class="err">${esc(err)}</div>
-      <p class="hint">From <a href="https://supabase.com/dashboard" target="_blank">supabase.com/dashboard</a> → your project → Project Settings → API: copy the Project URL and the <b>service_role</b> secret key. Only use this app on your own devices.</p>
+      <p class="hint">From the <a href="https://supabase.com/dashboard" target="_blank">Supabase dashboard</a> → Project Settings → API: the <b>publishable/anon</b> key (NOT service_role — that one stays out of browsers). This key is safe to share; row-level security means it grants nothing without a login.</p>
     </div>`;
-  $("#save").onclick = async () => {
-    localStorage.setItem("sb_url", $("#url").value.trim().replace(/\/+$/, ""));
-    localStorage.setItem("sb_key", $("#key").value.trim());
-    try { await sb("candidates?select=id&limit=1"); toast("Connected"); boot(); }
-    catch (e) { if (e.message !== "auth") renderSetup("Can't reach that project — check URL and key, and that schema.sql has been run."); }
+  $("#save").onclick = () => {
+    localStorage.setItem("sb_anon", $("#key").value.trim());
+    boot();
   };
+}
+
+/* ---------- login ---------- */
+function renderLogin(msg = "", isErr = false) {
+  app.innerHTML = `
+    <header><h1>Anthrogen Talent</h1></header>
+    <div class="card setup">
+      <label>Work email</label>
+      <input id="email" type="email" placeholder="you@anthrogen.com" value="${esc(localStorage.getItem("rr_email") || "")}" autocomplete="email">
+      <button class="save" id="magic">Email me a login link</button>
+      <label style="margin-top:18px">…or sign in with a password</label>
+      <input id="pw" type="password" placeholder="password" autocomplete="current-password">
+      <button class="alt" id="pwbtn">Sign in with password</button>
+      <div class="${isErr ? "err" : "ok"}">${esc(msg)}</div>
+    </div>`;
+  const email = () => { const e = $("#email").value.trim(); localStorage.setItem("rr_email", e); return e; };
+  $("#magic").onclick = async () => {
+    $("#magic").disabled = true;
+    const { error } = await supa.auth.signInWithOtp({
+      email: email(),
+      options: { emailRedirectTo: location.origin + location.pathname },
+    });
+    if (error) renderLogin(error.message, true);
+    else renderLogin("Link sent — check your email on this device.");
+  };
+  $("#pwbtn").onclick = async () => {
+    $("#pwbtn").disabled = true;
+    const { error } = await supa.auth.signInWithPassword({ email: email(), password: $("#pw").value });
+    if (error) renderLogin(error.message, true);
+    // success → onAuthStateChange boots the app
+  };
+}
+
+function renderNotAuthorized() {
+  app.innerHTML = `
+    <header><h1>Anthrogen Talent</h1></header>
+    <div class="empty"><div class="big">🚫</div>
+      <h2>${esc(state.user.email)} isn't authorized</h2>
+      <p>Ask Connor to add this email to the app_users table.</p>
+      <button class="save-btn" style="max-width:200px" id="out">Sign out</button></div>`;
+  $("#out").onclick = async () => { await supa.auth.signOut(); };
 }
 
 /* ---------- shell ---------- */
@@ -199,7 +243,19 @@ function shell(inner) {
       <button id="t-talent" class="${state.tab === "talent" ? "on" : ""}">Talent <span class="count" style="color:var(--dim)">${state.rows.length}</span></button>
     </div>
     <div id="body">${inner}</div>`;
-  $("#gear").onclick = () => renderSetup();
+  $("#gear").onclick = () => {
+    if ($(".menu")) return $(".menu").remove();
+    const m = document.createElement("div");
+    m.className = "menu";
+    m.innerHTML = `<div class="who">${esc(state.user.email)}</div>
+      <button id="m-refresh">Refresh</button>
+      <button id="m-key">Change key</button>
+      <button id="m-out">Sign out</button>`;
+    document.body.appendChild(m);
+    $("#m-refresh").onclick = () => { m.remove(); boot(); };
+    $("#m-key").onclick = () => { m.remove(); renderKeySetup(); };
+    $("#m-out").onclick = async () => { m.remove(); await supa.auth.signOut(); };
+  };
   $("#t-review").onclick = () => { state.tab = "review"; state.detail = null; render(); };
   $("#t-talent").onclick = () => { state.tab = "talent"; state.detail = null; render(); };
 }
@@ -258,7 +314,8 @@ function renderReview() {
       toast(`${c.name.split(" ")[0]} → ${b.dataset.v}`);
       render();
     } catch (e) {
-      if (e.message !== "auth") { toast("Save failed — try again"); $$(".actions button").forEach(x => x.disabled = false); }
+      toast("Save failed — try again");
+      $$(".actions button").forEach(x => x.disabled = false);
     }
   });
 }
@@ -308,7 +365,7 @@ function renderTalent() {
   $("#poolchip").onclick = async () => {
     if (!state.pool) {
       $("#poolchip").textContent = "loading…";
-      try { state.pool = await loadPool(); } catch (e) { if (e.message !== "auth") toast("Couldn't load pool"); return; }
+      try { state.pool = await loadPool(); } catch (e) { toast("Couldn't load pool"); return; }
     }
     state.includePool = !state.includePool;
     render();
@@ -339,20 +396,22 @@ function renderPoolDetail(p) {
         id: `${today()}-promoted-${crypto.randomUUID().slice(0, 8)}`,
         name: p.name, role: p.role === "MLE" ? "MLE" : "RS",
         affiliation: p.affiliation || "",
-        why: `Promoted from pool by Connor. Agent's original assessment (${p.evaluated}, ${p.tier}): ${p.assessment}`,
+        why: `Promoted from pool. Agent's original assessment (${p.evaluated}, ${p.tier}): ${p.assessment}`,
         evidence: (p.links || []).map(u => ({ label: u, url: u })),
         recruitability: "unknown — promoted from pool",
         watch_out: "pool record: needs re-verification",
-        sourced: today(), status: "pending",
-        notes: [{ date: today(), text: "promoted from evaluation pool" }],
-        feedback_pending: true,
+        sourced: today(), status: "pending", feedback_pending: true,
       };
-      await sb("candidates", { method: "POST", body: JSON.stringify([rec]) });
-      state.rows.unshift(rec);
+      unwrap(await supa.from("candidates").insert(rec));
+      const note = unwrap(await supa.from("notes")
+        .insert({ candidate_id: rec.id, author: state.user.email, text: "promoted from evaluation pool" })
+        .select())[0];
+      state.rows.unshift({ ...rec, notes: [note] });
       toast(`${p.name.split(" ")[0]} added to pipeline`);
       state.detail = null; render();
     } catch (e) {
-      if (e.message !== "auth") { toast("Save failed — try again"); $("#promote").disabled = false; }
+      toast("Save failed — try again");
+      $("#promote").disabled = false;
     }
   };
 }
@@ -372,7 +431,8 @@ function renderDetail() {
         <select id="status">${STATUSES.map(s => `<option ${s === c.status ? "selected" : ""}>${s}</option>`).join("")}</select>
       </div>
       <div class="section"><div class="label">Notes</div>
-        <ul class="notes">${(c.notes || []).map(n => `<li>${esc(n.text)}<span>${esc(n.date)}</span></li>`).join("") || ""}</ul>
+        <ul class="notes">${(c.notes || []).map(n =>
+          `<li>${esc(n.text)}<span>${esc((n.author || "").split("@")[0])} · ${esc(String(n.created_at || "").slice(0, 10))}</span></li>`).join("")}</ul>
         <textarea id="newnote" placeholder="add a note…"></textarea>
         <button class="save-btn" id="save">Save changes</button>
       </div>`)}`);
@@ -385,21 +445,37 @@ function renderDetail() {
       await pushFeedback(c, status, note);
       toast("Saved");
       render();
-    } catch (e) { if (e.message !== "auth") { toast("Save failed — try again"); $("#save").disabled = false; } }
+    } catch (e) { toast("Save failed — try again"); $("#save").disabled = false; }
   };
 }
 
 /* ---------- boot ---------- */
 function render() { state.tab === "review" ? renderReview() : renderTalent(); }
+let authWired = false;
 
 async function boot() {
-  if (!sbUrl() || !sbKey()) return renderSetup();
-  app.innerHTML = `<div class="spin">Loading talent database…</div>`;
+  if (!anonKey()) return renderKeySetup();
+  if (!supa) {
+    supa = createClient(SUPA_URL, anonKey(), { auth: { detectSessionInUrl: true, flowType: "implicit" } });
+    if (!authWired) {
+      authWired = true;
+      supa.auth.onAuthStateChange((event) => {
+        if (event === "SIGNED_IN" || event === "SIGNED_OUT") boot();
+      });
+    }
+  }
+  app.innerHTML = `<div class="spin">Loading…</div>`;
+  const { data: { session }, error } = await supa.auth.getSession();
+  if (error || !session) return renderLogin();
+  state.user = session.user;
   try {
+    const member = unwrap(await supa.from("app_users").select("email").eq("email", state.user.email));
+    if (!member.length) return renderNotAuthorized();
     state.rows = await loadCandidates();
     render();
   } catch (e) {
-    if (e.message !== "auth") renderSetup("Couldn't load the database — check URL, key, and that schema.sql has been run.");
+    if (String(e.message || "").includes("Invalid API key")) renderKeySetup("That key was rejected — paste the publishable/anon key.");
+    else renderLogin(`Couldn't load: ${e.message || e}`, true);
   }
 }
 boot();
