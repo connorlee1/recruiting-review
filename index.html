@@ -135,7 +135,7 @@ const STATUSES = ["pending", "yes", "maybe", "no", "contacted", "replied", "inte
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const app = $("#app");
-const state = { rows: null, tab: "review", reviewed: 0, search: "", filter: "all", detail: null, pool: null, includePool: false, user: null };
+const state = { rows: null, tab: "review", reviewed: 0, search: "", filter: "all", roleFilter: "all", detail: null, pool: null, includePool: false, user: null, roles: [], showRoles: false };
 let supa = null;
 
 const anonKey = () => SUPA_ANON_KEY || localStorage.getItem("sb_anon") || "";
@@ -160,6 +160,13 @@ const loadCandidates = async () => unwrap(
 const loadPool = async () => unwrap(
   await supa.from("pool").select("*")
     .order("evaluated", { ascending: false }).limit(2000));
+async function loadRoles() {
+  try { return unwrap(await supa.from("roles").select("*").order("created_at")); }
+  catch (e) {  // roles migration not applied yet — fall back to the founding pair
+    return [{ key: "RS", slug: "research-scientist", title: "Research Scientist", active: true },
+            { key: "MLE", slug: "ml-engineer", title: "ML / AI Engineer", active: true }];
+  }
+}
 
 async function pushFeedback(c, status, noteText) {
   unwrap(await supa.from("candidates")
@@ -248,10 +255,12 @@ function shell(inner) {
     const m = document.createElement("div");
     m.className = "menu";
     m.innerHTML = `<div class="who">${esc(state.user.email)}</div>
+      <button id="m-roles">Roles</button>
       <button id="m-refresh">Refresh</button>
       <button id="m-key">Change key</button>
       <button id="m-out">Sign out</button>`;
     document.body.appendChild(m);
+    $("#m-roles").onclick = () => { m.remove(); state.showRoles = true; render(); };
     $("#m-refresh").onclick = () => { m.remove(); boot(); };
     $("#m-key").onclick = () => { m.remove(); renderKeySetup(); };
     $("#m-out").onclick = async () => { m.remove(); await supa.auth.signOut(); };
@@ -273,6 +282,56 @@ function candidateCard(c, extra = "") {
       <div class="section"><div class="label">Watch out</div><p class="watch">${esc(c.watch_out)}</p></div>
       ${extra}
     </div>`;
+}
+
+/* ---------- roles screen ---------- */
+function renderRoles() {
+  shell(`
+    <button class="back" id="back">← Back</button>
+    <div class="card setup">
+      <div class="label">Open roles</div>
+      ${state.roles.map(r => `
+        <div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)">
+          <div style="flex:1"><b>${esc(r.key)}</b> — ${esc(r.title)}
+            ${r.brief ? `<div style="color:var(--dim);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.brief)}</div>` : ""}</div>
+          <button class="chip ${r.active ? "on" : ""}" data-toggle="${esc(r.key)}">${r.active ? "active" : "paused"}</button>
+        </div>`).join("")}
+      <div class="label" style="margin-top:20px">Add a role</div>
+      <label>Short code (the badge, e.g. CB)</label>
+      <input id="r-key" type="text" maxlength="6" autocomplete="off">
+      <label>Title</label>
+      <input id="r-title" type="text" placeholder="e.g. Computational Biologist" autocomplete="off">
+      <label>Brief the agent — its starting point for this role</label>
+      <textarea id="r-brief" style="height:130px" placeholder="Paste the JD or braindump: what they'll do here, must-haves, what great looks like, anti-patterns, example people or labs…"></textarea>
+      <button class="save" id="r-add">Add role</button>
+      <p class="hint">Tomorrow morning the agent turns this brief into a full calibration profile (researching the role's talent landscape) <i>before</i> sourcing — so even day one isn't generic. The richer the brief, the better day one is.</p>
+    </div>`);
+  $("#back").onclick = () => { state.showRoles = false; render(); };
+  $$("[data-toggle]").forEach(b => b.onclick = async () => {
+    const r = state.roles.find(x => x.key === b.dataset.toggle);
+    try {
+      unwrap(await supa.from("roles").update({ active: !r.active }).eq("key", r.key));
+      r.active = !r.active;
+      toast(`${r.key} ${r.active ? "active" : "paused"}`);
+      render();
+    } catch (e) { toast("Save failed — try again"); }
+  });
+  $("#r-add").onclick = async () => {
+    const key = $("#r-key").value.trim().toUpperCase();
+    const title = $("#r-title").value.trim();
+    const brief = $("#r-brief").value.trim();
+    if (!key || !title) return toast("Code and title are required");
+    if (!brief) return toast("Write a brief — that's what stops blind firing");
+    if (state.roles.some(r => r.key === key)) return toast(`${key} already exists`);
+    const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    $("#r-add").disabled = true;
+    try {
+      unwrap(await supa.from("roles").insert({ key, slug, title, brief, active: true }));
+      state.roles.push({ key, slug, title, brief, active: true });
+      toast(`${key} added — agent calibrates on its next run`);
+      render();
+    } catch (e) { toast("Save failed — is the roles migration applied?"); $("#r-add").disabled = false; }
+  };
 }
 
 /* ---------- review tab ---------- */
@@ -327,6 +386,7 @@ function renderTalent() {
   const present = [...new Set(state.rows.map(c => c.status))];
   const list = state.rows
     .filter(c => state.filter === "all" || c.status === state.filter)
+    .filter(c => state.roleFilter === "all" || c.role === state.roleFilter)
     .filter(c => !q || [c.name, c.affiliation, c.why, c.recruitability,
         ...(c.notes || []).map(n => n.text), ...(c.evidence || []).map(e => e.label)]
       .join(" ").toLowerCase().includes(q))
@@ -351,6 +411,10 @@ function renderTalent() {
         `<button class="chip ${state.filter === s ? "on" : ""}" data-s="${s}">${s}</button>`).join("")}
       <button class="chip ${state.includePool ? "on" : ""}" id="poolchip">+ pool${state.pool ? ` (${state.pool.length})` : ""}</button>
     </div>
+    ${state.roles.length > 1 ? `<div class="filters">
+      ${["all", ...state.roles.map(r => r.key)].map(r =>
+        `<button class="chip ${state.roleFilter === r ? "on" : ""}" data-r="${esc(r)}">${esc(r)}</button>`).join("")}
+    </div>` : ""}
     ${list.map(c => `
       <button class="row" data-id="${esc(c.id)}">
         <div class="who"><b>${esc(c.name)} <span style="color:var(--accent);font-size:12px">${esc(c.role)}</span></b>
@@ -362,6 +426,7 @@ function renderTalent() {
       `<div class="empty"><div class="big">🔍</div><h2>No matches</h2><p>${state.rows.length ? "Try a different search or filter." : "The database fills up as the agent runs each morning."}</p></div>`}`);
   $("#q").oninput = e => { state.search = e.target.value; render(); const i = $("#q"); i.focus(); i.setSelectionRange(i.value.length, i.value.length); };
   $$(".filters .chip[data-s]").forEach(b => b.onclick = () => { state.filter = b.dataset.s; render(); });
+  $$(".filters .chip[data-r]").forEach(b => b.onclick = () => { state.roleFilter = b.dataset.r; render(); });
   $("#poolchip").onclick = async () => {
     if (!state.pool) {
       $("#poolchip").textContent = "loading…";
@@ -385,6 +450,10 @@ function renderPoolDetail(p) {
         ${(p.links || []).map(u => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u)}</a>`).join("") || `<p style="color:var(--dim);font-size:14px">none</p>`}
       </div>
       <p style="color:var(--dim);font-size:13px;margin-top:14px">Pool records are lightweight — not fully verified.</p>
+      <div class="section"><div class="label">Promote as</div>
+        <select id="prole">${state.roles.filter(r => r.active).map(r =>
+          `<option value="${esc(r.key)}" ${r.key === p.role ? "selected" : ""}>${esc(r.key)} — ${esc(r.title)}</option>`).join("")}</select>
+      </div>
       <button class="save-btn" id="promote">Add to pipeline</button>
     </div>`);
   $("#back").onclick = () => { state.detail = null; render(); };
@@ -394,7 +463,7 @@ function renderPoolDetail(p) {
       if (state.rows.some(c => c.name.toLowerCase() === p.name.toLowerCase())) { toast("Already in pipeline"); return; }
       const rec = {
         id: `${today()}-promoted-${crypto.randomUUID().slice(0, 8)}`,
-        name: p.name, role: p.role === "MLE" ? "MLE" : "RS",
+        name: p.name, role: $("#prole").value,
         affiliation: p.affiliation || "",
         why: `Promoted from pool. Agent's original assessment (${p.evaluated}, ${p.tier}): ${p.assessment}`,
         evidence: (p.links || []).map(u => ({ label: u, url: u })),
@@ -450,7 +519,10 @@ function renderDetail() {
 }
 
 /* ---------- boot ---------- */
-function render() { state.tab === "review" ? renderReview() : renderTalent(); }
+function render() {
+  if (state.showRoles) return renderRoles();
+  state.tab === "review" ? renderReview() : renderTalent();
+}
 let authWired = false;
 
 async function boot() {
@@ -471,7 +543,7 @@ async function boot() {
   try {
     const member = unwrap(await supa.from("app_users").select("email").eq("email", state.user.email));
     if (!member.length) return renderNotAuthorized();
-    state.rows = await loadCandidates();
+    [state.rows, state.roles] = await Promise.all([loadCandidates(), loadRoles()]);
     render();
   } catch (e) {
     if (String(e.message || "").includes("Invalid API key")) renderKeySetup("That key was rejected — paste the publishable/anon key.");
