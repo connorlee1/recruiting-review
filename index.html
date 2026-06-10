@@ -136,7 +136,7 @@ const STATUSES = ["pending", "yes", "maybe", "no", "watch", "tracked", "contacte
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const app = $("#app");
-const state = { rows: null, tab: "review", reviewed: 0, reviewRole: null, search: "", filter: "all", roleFilter: "all", detail: null, pool: null, includePool: false, user: null, roles: [], showRoles: false };
+const state = { rows: null, tab: "review", reviewed: 0, reviewRole: null, search: "", filter: "all", roleFilter: "all", detail: null, pool: null, includePool: false, user: null, member: null, roles: [], showRoles: false };
 let supa = null;
 
 const anonKey = () => SUPA_ANON_KEY || localStorage.getItem("sb_anon") || "";
@@ -151,33 +151,72 @@ function esc(s) {
 const today = () => new Date().toISOString().slice(0, 10);
 function unwrap({ data, error }) { if (error) throw error; return data; }
 
-/* ---------- data ---------- */
-const loadCandidates = async () => unwrap(
-  await supa.from("candidates")
-    .select("*, notes(*)")
-    .order("sourced", { ascending: false }).order("id", { ascending: false })
+/* ---------- data ----------
+   The store is normalized: `people` (shared identity) + `reviews` (per-member
+   judgment). The UI works on a flat `row` per review that merges the joined person,
+   so render code stays shaped like the old `candidates` row. role = position.key. */
+
+// flatten a reviews-joined-to-people-and-position row into the legacy flat shape
+function flattenReview(r) {
+  const p = r.people || {};
+  return {
+    review_id: r.id,
+    person_id: r.person_id,
+    id: r.id,                          // render code keys off .id
+    name: p.name || "",
+    affiliation: p.affiliation || "",
+    evidence: p.evidence || [],
+    role: r.positions ? r.positions.key : r.role_key,
+    position_id: r.position_id,
+    member_id: r.member_id,
+    why: r.why || "",
+    recruitability: r.recruitability || "",
+    watch_out: r.watch_out || "",
+    tier: r.tier || null,
+    status: r.status,
+    watch_reason: r.watch_reason || null,
+    watch_revisit: r.watch_revisit || null,
+    sourced: r.sourced,
+    notes: r.notes || [],
+  };
+}
+
+// load the current member's reviews (admin still scopes the queue to themselves;
+// the all-team admin view is a separate Phase-B stats screen).
+const loadReviews = async () => {
+  const rows = unwrap(await supa.from("reviews")
+    .select("*, people(name,affiliation,evidence), positions(key,title), notes(*)")
+    .eq("member_id", state.member.id)
+    .order("sourced", { ascending: false })
     .order("created_at", { referencedTable: "notes", ascending: true })
-    .limit(1000));
+    .limit(2000));
+  return rows.map(flattenReview);
+};
 const loadPool = async () => unwrap(
   await supa.from("pool").select("*")
+    .eq("member_id", state.member.id)
     .order("evaluated", { ascending: false }).limit(2000));
+// positions the current member is assigned to (their reviewable roles)
 async function loadRoles() {
-  try { return unwrap(await supa.from("roles").select("*").order("created_at")); }
-  catch (e) {  // roles migration not applied yet — fall back to the founding pair
-    return [{ key: "RS", slug: "research-scientist", title: "Research Scientist", active: true },
-            { key: "MLE", slug: "ml-engineer", title: "ML / AI Engineer", active: true }];
-  }
+  const a = unwrap(await supa.from("assignments")
+    .select("positions(key,slug,title,brief,active)")
+    .eq("member_id", state.member.id));
+  const ps = a.map(x => x.positions).filter(Boolean).filter(p => p.active);
+  // admins with no explicit assignment still see all active positions
+  if (!ps.length && state.member.permission === "admin")
+    return unwrap(await supa.from("positions").select("key,slug,title,brief,active").eq("active", true).order("created_at"));
+  return ps;
 }
 
 async function pushFeedback(c, status, noteText) {
-  unwrap(await supa.from("candidates")
+  unwrap(await supa.from("reviews")
     .update({ status, status_updated: new Date().toISOString(), feedback_pending: true })
-    .eq("id", c.id));
+    .eq("id", c.review_id));
   c.status = status;
   if (noteText) {
     const note = unwrap(await supa.from("notes")
-      .insert({ candidate_id: c.id, author: state.user.email, text: noteText })
-      .select()) [0];
+      .insert({ review_id: c.review_id, author: state.user.email, text: noteText })
+      .select())[0];
     (c.notes = c.notes || []).push(note);
   }
 }
@@ -255,13 +294,14 @@ function shell(inner) {
     if ($(".menu")) return $(".menu").remove();
     const m = document.createElement("div");
     m.className = "menu";
-    m.innerHTML = `<div class="who">${esc(state.user.email)}</div>
-      <button id="m-roles">Roles</button>
+    const admin = state.member && state.member.permission === "admin";
+    m.innerHTML = `<div class="who">${esc(state.user.email)}${admin ? " · admin" : ""}</div>
+      ${admin ? `<button id="m-roles">Positions</button>` : ""}
       <button id="m-refresh">Refresh</button>
       <button id="m-key">Change key</button>
       <button id="m-out">Sign out</button>`;
     document.body.appendChild(m);
-    $("#m-roles").onclick = () => { m.remove(); state.showRoles = true; render(); };
+    if (admin) $("#m-roles").onclick = () => { m.remove(); state.showRoles = true; render(); };
     $("#m-refresh").onclick = () => { m.remove(); boot(); };
     $("#m-key").onclick = () => { m.remove(); renderKeySetup(); };
     $("#m-out").onclick = async () => { m.remove(); await supa.auth.signOut(); };
@@ -311,11 +351,11 @@ function renderRoles() {
   $$("[data-toggle]").forEach(b => b.onclick = async () => {
     const r = state.roles.find(x => x.key === b.dataset.toggle);
     try {
-      unwrap(await supa.from("roles").update({ active: !r.active }).eq("key", r.key));
+      unwrap(await supa.from("positions").update({ active: !r.active }).eq("id", r.id));
       r.active = !r.active;
       toast(`${r.key} ${r.active ? "active" : "paused"}`);
       render();
-    } catch (e) { toast("Save failed — try again"); }
+    } catch (e) { toast("Only admins can change positions"); }
   });
   $("#r-add").onclick = async () => {
     const key = $("#r-key").value.trim().toUpperCase();
@@ -327,11 +367,15 @@ function renderRoles() {
     const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
     $("#r-add").disabled = true;
     try {
-      unwrap(await supa.from("roles").insert({ key, slug, title, brief, active: true }));
-      state.roles.push({ key, slug, title, brief, active: true });
+      const row = unwrap(await supa.from("positions")
+        .insert({ org_id: state.member.org_id, key, slug, title, brief, active: true })
+        .select())[0];
+      // assign the creating admin to it so it shows in their queue
+      await supa.from("assignments").insert({ org_id: state.member.org_id, member_id: state.member.id, position_id: row.id, created_by: state.member.id });
+      state.roles.push(row);
       toast(`${key} added — agent calibrates on its next run`);
       render();
-    } catch (e) { toast("Save failed — is the roles migration applied?"); $("#r-add").disabled = false; }
+    } catch (e) { toast("Only admins can add positions"); $("#r-add").disabled = false; }
   };
 }
 
@@ -339,6 +383,11 @@ function renderRoles() {
 function roleTitle(key) {
   const r = state.roles.find(x => x.key === key);
   return r ? r.title : key;
+}
+// a pool row carries position_id, not a role key — resolve it for display
+function poolRole(p) {
+  const r = state.roles.find(x => x.id === p.position_id);
+  return r ? r.key : "";
 }
 
 function renderReview() {
@@ -473,7 +522,7 @@ function renderTalent() {
         .join(" ").toLowerCase().includes(q))
       .map(({ p, i }) => `
         <button class="row" data-pool="${i}" style="opacity:.78">
-          <div class="who"><b>${esc(p.name)} <span style="color:var(--dim);font-size:12px">${esc(p.role || "")}</span></b>
+          <div class="who"><b>${esc(p.name)} <span style="color:var(--dim);font-size:12px">${esc(poolRole(p))}</span></b>
             <span>${esc(p.affiliation || "")}${p.assessment ? " · " + esc(p.assessment) : ""}</span></div>
           <span class="pill s-pool">${esc(p.tier || "pool")}</span>
         </button>`).join("");
@@ -517,41 +566,26 @@ function renderPoolDetail(p) {
   shell(`
     <button class="back" id="back">← Talent</button>
     <div class="card">
-      <h2>${esc(p.name)}<span class="badge">${esc(p.role || "?")}</span></h2>
+      <h2>${esc(p.name)}<span class="badge">${esc(poolRole(p) || "?")}</span></h2>
       <div class="sub">${esc(p.affiliation || "")} · evaluated ${esc(p.evaluated || "?")} · ${esc(p.tier || "pool")} (via ${esc(p.channel || "?")})</div>
       <div class="section"><div class="label">Agent's assessment</div><p>${esc(p.assessment || "")}</p></div>
       <div class="section evidence"><div class="label">Links</div>
         ${(p.links || []).map(u => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u)}</a>`).join("") || `<p style="color:var(--dim);font-size:14px">none</p>`}
       </div>
       <p style="color:var(--dim);font-size:13px;margin-top:14px">Pool records are lightweight — not fully verified.</p>
-      <div class="section"><div class="label">Promote as</div>
-        <select id="prole">${state.roles.filter(r => r.active).map(r =>
-          `<option value="${esc(r.key)}" ${r.key === p.role ? "selected" : ""}>${esc(r.key)} — ${esc(r.title)}</option>`).join("")}</select>
-      </div>
-      <button class="save-btn" id="promote">Add to pipeline</button>
+      <button class="save-btn" id="promote">${p.promote_requested ? "✓ Promotion requested" : "Request promotion to pipeline"}</button>
+      <p class="hint">Promoting flags this person for your agent: on its next run it verifies them and adds them to your review queue (identity verification is the agent's job, so it can't be done from here).</p>
     </div>`);
   $("#back").onclick = () => { state.detail = null; render(); };
+  if (p.promote_requested) $("#promote").disabled = true;
   $("#promote").onclick = async () => {
     $("#promote").disabled = true;
     try {
-      if (state.rows.some(c => c.name.toLowerCase() === p.name.toLowerCase())) { toast("Already in pipeline"); return; }
-      const rec = {
-        id: `${today()}-promoted-${crypto.randomUUID().slice(0, 8)}`,
-        name: p.name, role: $("#prole").value,
-        affiliation: p.affiliation || "",
-        why: `Promoted from pool. Agent's original assessment (${p.evaluated}, ${p.tier}): ${p.assessment}`,
-        evidence: (p.links || []).map(u => ({ label: u, url: u })),
-        recruitability: "unknown — promoted from pool",
-        watch_out: "pool record: needs re-verification",
-        sourced: today(), status: "pending", feedback_pending: true,
-      };
-      unwrap(await supa.from("candidates").insert(rec));
-      const note = unwrap(await supa.from("notes")
-        .insert({ candidate_id: rec.id, author: state.user.email, text: "promoted from evaluation pool" })
-        .select())[0];
-      state.rows.unshift({ ...rec, notes: [note] });
-      toast(`${p.name.split(" ")[0]} added to pipeline`);
-      state.detail = null; render();
+      if (state.rows.some(c => c.name.toLowerCase() === p.name.toLowerCase())) { toast("Already in your pipeline"); return; }
+      unwrap(await supa.from("pool").update({ promote_requested: true }).eq("id", p.id));
+      p.promote_requested = true;
+      toast(`${p.name.split(" ")[0]} flagged for promotion`);
+      render();
     } catch (e) {
       toast("Save failed — try again");
       $("#promote").disabled = false;
@@ -615,9 +649,14 @@ async function boot() {
   if (error || !session) return renderLogin();
   state.user = session.user;
   try {
-    const member = unwrap(await supa.from("app_users").select("email").eq("email", state.user.email));
-    if (!member.length) return renderNotAuthorized();
-    [state.rows, state.roles] = await Promise.all([loadCandidates(), loadRoles()]);
+    // resolve the logged-in email to a member row (org + permission). RLS already
+    // scopes this to the caller's org; a non-member sees zero rows → not authorized.
+    const members = unwrap(await supa.from("members")
+      .select("id,org_id,email,name,permission,active")
+      .ilike("email", state.user.email).eq("active", true));
+    if (!members.length) return renderNotAuthorized();
+    state.member = members[0];
+    [state.rows, state.roles] = await Promise.all([loadReviews(), loadRoles()]);
     render();
   } catch (e) {
     if (String(e.message || "").includes("Invalid API key")) renderKeySetup("That key was rejected — paste the publishable/anon key.");
