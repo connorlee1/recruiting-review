@@ -91,6 +91,7 @@
   .s-no, .s-archived { background: rgba(218,54,51,.18); color: #ff7b72; }
   .s-maybe { background: rgba(210,153,34,.18); color: #d29922; }
   .s-contacted, .s-replied, .s-interviewing, .s-offer { background: rgba(88,166,255,.16); color: var(--accent); }
+  .s-pool { background: #30363d; color: var(--dim); border: 1px dashed var(--border); }
 
   .filters { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; margin: 10px 0; -webkit-overflow-scrolling: touch; }
   .filters .chip { flex-shrink: 0; }
@@ -126,7 +127,7 @@ const STATUSES = ["pending", "yes", "maybe", "no", "contacted", "replied", "inte
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const app = $("#app");
-const state = { db: null, tab: "review", reviewed: 0, search: "", filter: "all", detail: null };
+const state = { db: null, tab: "review", reviewed: 0, search: "", filter: "all", detail: null, pool: null, includePool: false };
 
 const token = () => localStorage.getItem("rr_token") || "";
 const repo  = () => localStorage.getItem("rr_repo") || DEFAULT_REPO;
@@ -182,6 +183,22 @@ async function saveDb(mutate, message) {
     if (res.status !== 409 && res.status !== 422) throw new Error(`commit ${res.status}`);
   }
   throw new Error("conflict");
+}
+
+async function fetchPool() {
+  const r = await gh("contents/candidates/pool?ref=main");
+  if (!r.ok) return [];
+  const files = (await r.json()).filter(f => f.name.endsWith(".json"));
+  const all = [];
+  for (const f of files) {
+    try {
+      const fr = await gh(`contents/candidates/pool/${f.name}?ref=main`);
+      if (!fr.ok) continue;
+      const d = JSON.parse(b64decode((await fr.json()).content));
+      all.push(...(d.evaluated || []));
+    } catch (e) { /* malformed shard — skip */ }
+  }
+  return all;
 }
 
 function applyFeedback(c, status, noteText) {
@@ -304,25 +321,97 @@ function renderTalent() {
         ...(c.notes || []).map(n => n.text), ...(c.evidence || []).map(e => e.label)]
       .join(" ").toLowerCase().includes(q))
     .sort((a, b) => (b.sourced || "").localeCompare(a.sourced || ""));
+  let poolRows = "";
+  if (state.includePool && state.pool) {
+    poolRows = state.pool
+      .map((p, i) => ({ p, i }))
+      .filter(({ p }) => !q || [p.name, p.affiliation, p.assessment, p.tier, p.channel]
+        .join(" ").toLowerCase().includes(q))
+      .sort((a, b) => (b.p.evaluated || "").localeCompare(a.p.evaluated || ""))
+      .map(({ p, i }) => `
+        <button class="row" data-pool="${i}" style="opacity:.78">
+          <div class="who"><b>${esc(p.name)} <span style="color:var(--dim);font-size:12px">${esc(p.role || "")}</span></b>
+            <span>${esc(p.affiliation || "")}${p.assessment ? " · " + esc(p.assessment) : ""}</span></div>
+          <span class="pill s-pool">${esc(p.tier || "pool")}</span>
+        </button>`).join("");
+  }
   shell(`
     <input type="search" id="q" placeholder="Search name, affiliation, notes…" value="${esc(state.search)}">
     <div class="filters">
       ${["all", ...STATUSES.filter(s => present.includes(s))].map(s =>
         `<button class="chip ${state.filter === s ? "on" : ""}" data-s="${s}">${s}</button>`).join("")}
+      <button class="chip ${state.includePool ? "on" : ""}" id="poolchip">+ pool${state.pool ? ` (${state.pool.length})` : ""}</button>
     </div>
     ${list.map(c => `
       <button class="row" data-id="${esc(c.id)}">
         <div class="who"><b>${esc(c.name)} <span style="color:var(--accent);font-size:12px">${esc(c.role)}</span></b>
           <span>${esc(c.affiliation)}</span></div>
         <span class="pill s-${esc(c.status)}">${esc(c.status)}</span>
-      </button>`).join("") ||
+      </button>`).join("")}
+    ${poolRows}
+    ${(list.length || poolRows) ? "" :
       `<div class="empty"><div class="big">🔍</div><h2>No matches</h2><p>${state.db.candidates.length ? "Try a different search or filter." : "The database fills up as the agent runs each morning."}</p></div>`}`);
   $("#q").oninput = e => { state.search = e.target.value; render(); const i = $("#q"); i.focus(); i.setSelectionRange(i.value.length, i.value.length); };
-  $$(".filters .chip").forEach(b => b.onclick = () => { state.filter = b.dataset.s; render(); });
-  $$(".row").forEach(r => r.onclick = () => { state.detail = r.dataset.id; render(); });
+  $$(".filters .chip[data-s]").forEach(b => b.onclick = () => { state.filter = b.dataset.s; render(); });
+  $("#poolchip").onclick = async () => {
+    if (!state.pool) {
+      $("#poolchip").textContent = "loading…";
+      try { state.pool = await fetchPool(); } catch (e) { toast("Couldn't load pool"); return; }
+    }
+    state.includePool = !state.includePool;
+    render();
+  };
+  $$(".row[data-id]").forEach(r => r.onclick = () => { state.detail = r.dataset.id; render(); });
+  $$(".row[data-pool]").forEach(r => r.onclick = () => { state.detail = "pool:" + r.dataset.pool; render(); });
+}
+
+function renderPoolDetail(p) {
+  shell(`
+    <button class="back" id="back">← Talent</button>
+    <div class="card">
+      <h2>${esc(p.name)}<span class="badge">${esc(p.role || "?")}</span></h2>
+      <div class="sub">${esc(p.affiliation || "")} · evaluated ${esc(p.evaluated || "?")} · ${esc(p.tier || "pool")} (via ${esc(p.channel || "?")})</div>
+      <div class="section"><div class="label">Agent's assessment</div><p>${esc(p.assessment || "")}</p></div>
+      <div class="section evidence"><div class="label">Links</div>
+        ${(p.links || []).map(u => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u)}</a>`).join("") || `<p style="color:var(--dim);font-size:14px">none</p>`}
+      </div>
+      <p style="color:var(--dim);font-size:13px;margin-top:14px">Pool records are lightweight — not fully verified.</p>
+      <button class="save-btn" id="promote">Add to pipeline</button>
+    </div>`);
+  $("#back").onclick = () => { state.detail = null; render(); };
+  $("#promote").onclick = async () => {
+    $("#promote").disabled = true;
+    try {
+      await saveDb(d => {
+        if ((d.candidates || []).some(c => c.name.toLowerCase() === p.name.toLowerCase())) throw new Error("already in pipeline");
+        d.candidates.push({
+          id: `${today()}-promoted-${d.candidates.length + 1}`,
+          name: p.name, role: p.role === "MLE" ? "MLE" : "RS",
+          affiliation: p.affiliation || "",
+          why: `Promoted from pool by Connor. Agent's original assessment (${p.evaluated}, ${p.tier}): ${p.assessment}`,
+          evidence: (p.links || []).map(u => ({ label: u, url: u })),
+          recruitability: "unknown — promoted from pool",
+          watch_out: "pool record: needs re-verification",
+          sourced: today(), status: "pending", status_updated: null,
+          notes: [{ date: today(), text: "promoted from evaluation pool" }],
+          feedback_pending: true,
+        });
+      }, `promote from pool: ${p.name}`);
+      toast(`${p.name.split(" ")[0]} added to pipeline`);
+      state.detail = null; render();
+    } catch (e) {
+      toast(e.message === "already in pipeline" ? "Already in pipeline" : "Commit failed — try again");
+      $("#promote").disabled = false;
+    }
+  };
 }
 
 function renderDetail() {
+  if (String(state.detail).startsWith("pool:")) {
+    const p = (state.pool || [])[Number(state.detail.slice(5))];
+    if (!p) { state.detail = null; return render(); }
+    return renderPoolDetail(p);
+  }
   const c = state.db.candidates.find(x => x.id === state.detail);
   if (!c) { state.detail = null; return render(); }
   shell(`
