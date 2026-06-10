@@ -91,6 +91,7 @@
   .s-no, .s-archived { background: rgba(218,54,51,.18); color: #ff7b72; }
   .s-maybe { background: rgba(210,153,34,.18); color: #d29922; }
   .s-contacted, .s-replied, .s-interviewing, .s-offer { background: rgba(88,166,255,.16); color: var(--accent); }
+  .s-watch, .s-tracked { background: rgba(210,153,34,.18); color: #d29922; }
   .s-pool { background: #30363d; color: var(--dim); border: 1px dashed var(--border); }
 
   .filters { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; margin: 10px 0; -webkit-overflow-scrolling: touch; }
@@ -130,7 +131,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const SUPA_URL = "https://iqzfpguwwdxmefnopsay.supabase.co";
 const SUPA_ANON_KEY = "";   // optional hardcode; falls back to localStorage
 const CHIPS = ["too junior", "too senior", "wrong subfield", "weak evidence", "not recruitable", "strong fit", "reach out fast"];
-const STATUSES = ["pending", "yes", "maybe", "no", "contacted", "replied", "interviewing", "offer", "hired", "archived"];
+const STATUSES = ["pending", "yes", "maybe", "no", "watch", "tracked", "contacted", "replied", "interviewing", "offer", "hired", "archived"];
 
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
@@ -341,15 +342,18 @@ function roleTitle(key) {
 }
 
 function renderReview() {
-  const pending = state.rows.filter(c => c.status === "pending");
-  // counts of pending per role, in the roles table's order
+  // two review lanes: contact-now ('pending') and keep-warm ('watch')
+  const inReview = state.rows.filter(c => c.status === "pending" || c.status === "watch");
   const byRole = state.roles
-    .map(r => ({ key: r.key, title: r.title, n: pending.filter(c => c.role === r.key).length }))
-    .filter(r => r.n > 0);
-  // any pending candidate whose role isn't in the roles list (shouldn't happen, but don't lose them)
-  const orphan = pending.filter(c => !state.roles.some(r => r.key === c.role)).length;
+    .map(r => ({
+      key: r.key, title: r.title,
+      now: inReview.filter(c => c.role === r.key && c.status === "pending").length,
+      warm: inReview.filter(c => c.role === r.key && c.status === "watch").length,
+    }))
+    .filter(r => r.now + r.warm > 0);
+  const orphan = inReview.filter(c => !state.roles.some(r => r.key === c.role)).length;
 
-  if (!pending.length) {
+  if (!inReview.length) {
     shell(`<div class="empty"><div class="big">${state.reviewed ? "✅" : "📭"}</div>
       <h2>${state.reviewed ? "All done" : "Queue is clear"}</h2>
       <p>${state.reviewed
@@ -359,57 +363,75 @@ function renderReview() {
     return;
   }
 
-  // role picker: shown when more than one role has a pending queue and none is chosen
   const choices = byRole.length + (orphan ? 1 : 0);
   if (!state.reviewRole && choices > 1) {
     shell(`
       <div class="empty" style="padding:24px 8px 8px">
         <div class="big">📋</div>
         <h2>Pick a queue to review</h2>
-        <p>${pending.length} candidates pending. Review one role at a time to stay focused.</p>
+        <p>${inReview.length} to review. One role at a time to stay focused.</p>
       </div>
       ${byRole.map(r => `
         <button class="row" data-rolepick="${esc(r.key)}">
-          <div class="who"><b>${esc(r.title)}</b><span>${r.n} pending</span></div>
-          <span class="pill s-pending">${r.n}</span>
+          <div class="who"><b>${esc(r.title)}</b><span>${r.now} to contact${r.warm ? ` · ${r.warm} keep-warm` : ""}</span></div>
+          <span class="pill s-pending">${r.now + r.warm}</span>
         </button>`).join("")}
       ${orphan ? `<button class="row" data-rolepick="__all__">
           <div class="who"><b>Everything</b><span>review all roles in one stream</span></div>
-          <span class="pill s-pending">${pending.length}</span></button>` : ""}`);
+          <span class="pill s-pending">${inReview.length}</span></button>` : ""}`);
     $$("[data-rolepick]").forEach(b => b.onclick = () => { state.reviewRole = b.dataset.rolepick; state.reviewed = 0; render(); });
     return;
   }
 
-  // if only one role has a queue, just review it (no picker needed)
   const activeRole = state.reviewRole || (byRole[0] && byRole[0].key) || "__all__";
-  const queue = pending
-    .filter(c => activeRole === "__all__" || c.role === activeRole)
-    .sort((a, b) => (a.sourced || "").localeCompare(b.sourced || ""));
+  const inRole = c => activeRole === "__all__" || c.role === activeRole;
+  // contact-now first, then keep-warm — never interleaved
+  const nowQ = inReview.filter(c => inRole(c) && c.status === "pending").sort((a, b) => (a.sourced || "").localeCompare(b.sourced || ""));
+  const warmQ = inReview.filter(c => inRole(c) && c.status === "watch").sort((a, b) => (a.sourced || "").localeCompare(b.sourced || ""));
 
-  if (!queue.length) {
-    // finished this role's queue; bounce back to picker (or done)
-    state.reviewRole = null;
-    return renderReview();
-  }
+  if (!nowQ.length && !warmQ.length) { state.reviewRole = null; return renderReview(); }
+
+  const lane = nowQ.length ? "now" : "warm";       // finish contact-now before keep-warm
+  const queue = lane === "now" ? nowQ : warmQ;
   const c = queue[0];
   const roleLabel = activeRole === "__all__" ? "All roles" : roleTitle(activeRole);
   const switchable = choices > 1;
-  shell(`
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-      <span class="pill s-pending">${esc(roleLabel)}</span>
-      ${switchable ? `<button class="back" id="switch" style="margin:0">⇄ switch queue</button>` : ""}
-    </div>` +
-    candidateCard(c, `
-      <div class="section"><div class="label">Note (optional — this trains the agent)</div>
-        <div class="chips">${CHIPS.map(t => `<button class="chip" data-t="${esc(t)}">${esc(t)}</button>`).join("")}</div>
-        <textarea id="note" placeholder="why yes / why no…"></textarea>
-      </div>
-      <div class="actions">
+
+  // keep-warm lane: different framing + verdicts (Track / Skip)
+  const laneBanner = lane === "warm"
+    ? `<div class="section" style="margin-top:0"><div class="label" style="color:var(--maybe)">🔥 Keep warm — relationship-building, not contact-now</div>
+        <p style="color:var(--dim);font-size:14px">${esc(c.watch_reason || "Strong but not recruitable yet.")}${c.watch_revisit ? ` <b style="color:var(--text)">· revisit ${esc(c.watch_revisit)}</b>` : ""}</p></div>`
+    : "";
+  const actions = lane === "warm"
+    ? `<div class="actions">
+        <button class="b-no" data-v="no">👎 Skip</button>
+        <button class="b-yes" data-v="tracked">🔥 Track</button>
+      </div>`
+    : `<div class="actions">
         <button class="b-no" data-v="no">👎 No</button>
         <button class="b-maybe" data-v="maybe">🤔</button>
         <button class="b-yes" data-v="yes">👍 Yes</button>
-      </div>`) +
-    `<div class="progress">${esc(roleLabel)} · ${state.reviewed + 1} of ${state.reviewed + queue.length} · ${queue.length} left in this queue</div>`);
+      </div>`;
+  const lanePill = lane === "warm"
+    ? `<span class="pill s-maybe">${esc(roleLabel)} · keep warm</span>`
+    : `<span class="pill s-pending">${esc(roleLabel)}</span>`;
+  const progress = lane === "warm"
+    ? `${esc(roleLabel)} keep-warm · ${state.reviewed + 1} · ${queue.length} left${nowQ.length ? "" : ""}`
+    : `${esc(roleLabel)} · contact-now ${state.reviewed + 1} of ${state.reviewed + nowQ.length}${warmQ.length ? ` · then ${warmQ.length} keep-warm` : ""}`;
+
+  shell(`
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+      ${lanePill}
+      ${switchable ? `<button class="back" id="switch" style="margin:0">⇄ switch queue</button>` : ""}
+    </div>` +
+    laneBanner +
+    candidateCard(c, `
+      <div class="section"><div class="label">Note (optional — this trains the agent)</div>
+        <div class="chips">${CHIPS.map(t => `<button class="chip" data-t="${esc(t)}">${esc(t)}</button>`).join("")}</div>
+        <textarea id="note" placeholder="${lane === "warm" ? "why track / why skip…" : "why yes / why no…"}"></textarea>
+      </div>
+      ${actions}`) +
+    `<div class="progress">${progress}</div>`);
   if (switchable) $("#switch").onclick = () => { state.reviewRole = null; state.reviewed = 0; render(); };
   $$(".chip").forEach(ch => ch.onclick = () => {
     ch.classList.toggle("on");
