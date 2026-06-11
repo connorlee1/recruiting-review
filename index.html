@@ -100,6 +100,8 @@
   .notes li { font-size: 14px; background: var(--card2); border-radius: 8px; padding: 8px 10px; margin-bottom: 6px; list-style: none; }
   .notes li span { color: var(--dim); font-size: 12px; display: block; }
   .save-btn { width: 100%; margin-top: 10px; padding: 12px; background: var(--accent); color: #04121f; font-weight: 700; }
+  .slack-btn { width: 100%; margin-top: 12px; padding: 11px; background: #1c2128; border: 1px solid #4A154B; color: #d9a8e0; font-weight: 600; }
+  .slack-btn:disabled { opacity: .7; }
 
   .setup label { display: block; font-size: 13px; color: var(--dim); margin: 14px 0 4px; }
   .setup .save { width: 100%; margin-top: 18px; padding: 14px; background: var(--accent); color: #04121f; font-weight: 700; font-size: 16px; }
@@ -137,7 +139,7 @@ const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const app = $("#app");
 const state = { rows: null, tab: "review", reviewed: 0, reviewRole: null, search: "", filter: "all", roleFilter: "all", detail: null, pool: null, includePool: false, user: null, member: null, roles: [], showRoles: false,
-  adminTab: "positions", admin: null };  // admin = { members, positions, assignments, reviews, events } lazy-loaded
+  adminTab: "positions", admin: null, slackOn: false };  // admin lazy-loaded; slackOn = Slack configured for org
 let supa = null;
 
 const anonKey = () => SUPA_ANON_KEY || localStorage.getItem("sb_anon") || "";
@@ -226,6 +228,12 @@ const loadAllReviews = async () => unwrap(await supa.from("reviews")
   .limit(10000));
 const loadAllStatusEvents = async () => unwrap(await supa.from("status_events")
   .select("review_id,from_status,to_status,author,created_at").limit(20000));
+
+async function shareToSlack(c) {
+  const { data, error } = await supa.functions.invoke("share-to-slack", { body: { review_id: c.review_id } });
+  if (error || (data && data.error)) throw new Error((data && data.error) || error.message || "share failed");
+  return data;
+}
 
 async function pushFeedback(c, status, noteText) {
   unwrap(await supa.from("reviews")
@@ -353,7 +361,21 @@ function candidateCard(c, extra = "") {
       <div class="section"><div class="label">Recruitability</div><p>${esc(c.recruitability)}</p></div>
       <div class="section"><div class="label">Watch out</div><p class="watch">${esc(c.watch_out)}</p></div>
       ${extra}
+      ${state.slackOn ? `<button class="slack-btn" data-slack="${esc(c.review_id)}">📣 Share to Slack</button>` : ""}
     </div>`;
+}
+
+// wire any Share-to-Slack buttons currently on screen (call after each render)
+function wireSlack() {
+  $$("[data-slack]").forEach(b => b.onclick = async () => {
+    b.disabled = true; const orig = b.textContent; b.textContent = "Sharing…";
+    try {
+      await shareToSlack({ review_id: b.dataset.slack });
+      b.textContent = "✓ Shared"; toast("Shared to Slack");
+    } catch (e) {
+      b.disabled = false; b.textContent = orig; toast(`Slack: ${e.message}`);
+    }
+  });
 }
 
 /* ---------- admin Team screen (admin only) ---------- */
@@ -375,14 +397,15 @@ async function renderAdmin() {
   shell(`
     <button class="back" id="back">← Back</button>
     <div class="tabs" style="margin-bottom:12px">
-      ${["positions","members","assign","stats"].map(t =>
-        `<button class="${tab===t?"on":""}" data-atab="${t}" style="font-size:13px;padding:8px 0">${
-          ({positions:"Positions",members:"Members",assign:"Assign",stats:"Stats"})[t]}</button>`).join("")}
+      ${["positions","members","assign","stats","slack"].map(t =>
+        `<button class="${tab===t?"on":""}" data-atab="${t}" style="font-size:12px;padding:8px 0">${
+          ({positions:"Positions",members:"Members",assign:"Assign",stats:"Stats",slack:"Slack"})[t]}</button>`).join("")}
     </div>
     <div id="abody">${
       tab==="positions" ? adminPositions(positions) :
       tab==="members"   ? adminMembers(members) :
       tab==="assign"    ? adminAssign(members, positions, assignments) :
+      tab==="slack"     ? adminSlack() :
                           adminStats()
     }</div>`);
   $("#back").onclick = () => { state.showRoles = false; render(); };
@@ -390,6 +413,37 @@ async function renderAdmin() {
   if (tab==="positions") wirePositions();
   else if (tab==="members") wireMembers();
   else if (tab==="assign") wireAssign();
+  else if (tab==="slack") wireSlackAdmin();
+}
+
+/* --- Slack tab (admin sets the org webhook) --- */
+function adminSlack() {
+  return `<div class="card setup">
+    <div class="label">Slack — Share to channel</div>
+    <p style="font-size:14px;color:var(--dim)">Paste a Slack <b>Incoming Webhook</b> URL. Reviewers then get a “📣 Share to Slack” button on every candidate that posts a rich profile to your channel. The URL is stored server-side and never exposed to reviewers.</p>
+    <label>Incoming webhook URL</label>
+    <input id="sl-url" type="password" placeholder="https://hooks.slack.com/services/…" autocomplete="off">
+    <label>Channel label (optional, just for display)</label>
+    <input id="sl-hint" type="text" placeholder="#recruiting" autocomplete="off">
+    <button class="save" id="sl-save">Save</button>
+    <p class="hint">Create one at <a href="https://api.slack.com/messaging/webhooks" target="_blank">api.slack.com → Incoming Webhooks</a>: create an app for your workspace, enable Incoming Webhooks, add one to your channel, copy the URL. ${state.slackOn ? "<b style='color:#3fb950'>Currently configured.</b>" : ""}</p>
+  </div>`;
+}
+function wireSlackAdmin() {
+  $("#sl-save").onclick = async () => {
+    const u = $("#sl-url").value.trim(), hint = $("#sl-hint").value.trim();
+    if (u && !u.startsWith("https://hooks.slack.com/")) return toast("That doesn't look like a Slack webhook URL");
+    $("#sl-save").disabled = true;
+    try {
+      // upsert the org's integration row (admin-only under RLS)
+      unwrap(await supa.from("integrations")
+        .upsert({ org_id: state.member.org_id, slack_webhook_url: u || null, slack_channel_hint: hint, updated_at: new Date().toISOString() },
+                { onConflict: "org_id" }));
+      state.slackOn = !!u;
+      toast(u ? "Slack connected" : "Slack cleared");
+      render();
+    } catch (e) { toast("Save failed — admin only"); $("#sl-save").disabled = false; }
+  };
 }
 
 /* --- Positions tab --- */
@@ -859,7 +913,8 @@ function renderDetail() {
 /* ---------- boot ---------- */
 function render() {
   if (state.showRoles) return renderAdmin();
-  state.tab === "review" ? renderReview() : renderTalent();
+  if (state.tab === "review") renderReview(); else renderTalent();
+  if (state.slackOn) wireSlack();   // wire any Share buttons the screen drew
 }
 let authWired = false;
 
@@ -887,6 +942,7 @@ async function boot() {
     if (!members.length) return renderNotAuthorized();
     state.member = members[0];
     [state.rows, state.roles] = await Promise.all([loadReviews(), loadRoles()]);
+    try { state.slackOn = !!unwrap(await supa.rpc("slack_configured")); } catch (e) { state.slackOn = false; }
     render();
   } catch (e) {
     if (String(e.message || "").includes("Invalid API key")) renderKeySetup("That key was rejected — paste the publishable/anon key.");
