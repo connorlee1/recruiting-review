@@ -167,7 +167,7 @@ function flattenReview(r) {
     name: p.name || "",
     affiliation: p.affiliation || "",
     education: p.education || "",
-    current_role: p.current_role || "",
+    role_title: p.role_title || "",
     location: p.location || "",
     experience: p.experience || "",
     evidence: p.evidence || [],
@@ -190,7 +190,7 @@ function flattenReview(r) {
 // the all-team admin view is a separate Phase-B stats screen).
 const loadReviews = async () => {
   const rows = unwrap(await supa.from("reviews")
-    .select("*, people(name,affiliation,education,current_role,location,experience,evidence), positions(key,title), notes(*)")
+    .select("*, people(name,affiliation,education,role_title,location,experience,evidence), positions(key,title), notes(*)")
     .eq("member_id", state.member.id)
     .order("sourced", { ascending: false })
     .order("created_at", { referencedTable: "notes", ascending: true })
@@ -336,7 +336,7 @@ function profileRow(label, val) {
 }
 function candidateCard(c, extra = "") {
   const profile = [
-    profileRow("Current", c.current_role),
+    profileRow("Current", c.role_title),
     profileRow("Education", c.education),
     profileRow("Location", c.location),
     profileRow("Experience", c.experience),
