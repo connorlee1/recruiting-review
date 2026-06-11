@@ -425,22 +425,25 @@ function adminSlack() {
     <input id="sl-url" type="password" placeholder="https://hooks.slack.com/services/…" autocomplete="off">
     <label>Channel label (optional, just for display)</label>
     <input id="sl-hint" type="text" placeholder="#recruiting" autocomplete="off">
+    <label>Signing secret (enables the “Mark contacted” button)</label>
+    <input id="sl-sign" type="password" placeholder="Slack app → Basic Information → Signing Secret" autocomplete="off">
     <button class="save" id="sl-save">Save</button>
-    <p class="hint">Create one at <a href="https://api.slack.com/messaging/webhooks" target="_blank">api.slack.com → Incoming Webhooks</a>: create an app for your workspace, enable Incoming Webhooks, add one to your channel, copy the URL. ${state.slackOn ? "<b style='color:#3fb950'>Currently configured.</b>" : ""}</p>
+    <p class="hint">Webhook: <a href="https://api.slack.com/messaging/webhooks" target="_blank">api.slack.com → Incoming Webhooks</a>. Signing secret (for interactive buttons): your Slack app → Basic Information → App Credentials → Signing Secret, and set Interactivity → Request URL to the slack-interactivity function. ${state.slackOn ? "<b style='color:#3fb950'>Webhook configured.</b>" : ""}</p>
   </div>`;
 }
 function wireSlackAdmin() {
   $("#sl-save").onclick = async () => {
-    const u = $("#sl-url").value.trim(), hint = $("#sl-hint").value.trim();
+    const u = $("#sl-url").value.trim(), hint = $("#sl-hint").value.trim(), sign = $("#sl-sign").value.trim();
     if (u && !u.startsWith("https://hooks.slack.com/")) return toast("That doesn't look like a Slack webhook URL");
     $("#sl-save").disabled = true;
     try {
-      // upsert the org's integration row (admin-only under RLS)
-      unwrap(await supa.from("integrations")
-        .upsert({ org_id: state.member.org_id, slack_webhook_url: u || null, slack_channel_hint: hint, updated_at: new Date().toISOString() },
-                { onConflict: "org_id" }));
-      state.slackOn = !!u;
-      toast(u ? "Slack connected" : "Slack cleared");
+      // only send fields the admin actually filled (so re-saving one doesn't wipe the other)
+      const row = { org_id: state.member.org_id, slack_channel_hint: hint, updated_at: new Date().toISOString() };
+      if (u) row.slack_webhook_url = u;
+      if (sign) row.slack_signing_secret = sign;
+      unwrap(await supa.from("integrations").upsert(row, { onConflict: "org_id" }));
+      if (u) state.slackOn = true;
+      toast("Slack settings saved");
       render();
     } catch (e) { toast("Save failed — admin only"); $("#sl-save").disabled = false; }
   };
