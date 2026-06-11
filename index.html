@@ -136,7 +136,8 @@ const STATUSES = ["pending", "yes", "maybe", "no", "watch", "tracked", "contacte
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const app = $("#app");
-const state = { rows: null, tab: "review", reviewed: 0, reviewRole: null, search: "", filter: "all", roleFilter: "all", detail: null, pool: null, includePool: false, user: null, member: null, roles: [], showRoles: false };
+const state = { rows: null, tab: "review", reviewed: 0, reviewRole: null, search: "", filter: "all", roleFilter: "all", detail: null, pool: null, includePool: false, user: null, member: null, roles: [], showRoles: false,
+  adminTab: "positions", admin: null };  // admin = { members, positions, assignments, reviews, events } lazy-loaded
 let supa = null;
 
 const anonKey = () => SUPA_ANON_KEY || localStorage.getItem("sb_anon") || "";
@@ -204,9 +205,23 @@ async function loadRoles() {
   const ps = a.map(x => x.positions).filter(Boolean).filter(p => p.active);
   // admins with no explicit assignment still see all active positions
   if (!ps.length && state.member.permission === "admin")
-    return unwrap(await supa.from("positions").select("key,slug,title,brief,active").eq("active", true).order("created_at"));
+    return unwrap(await supa.from("positions").select("id,key,slug,title,brief,active").eq("active", true).order("created_at"));
   return ps;
 }
+
+/* ---------- admin-only loaders (RLS already permits admin to read all in-org) ---------- */
+const loadAllMembers = async () => unwrap(await supa.from("members")
+  .select("id,email,name,permission,active").order("created_at"));
+const loadAllPositions = async () => unwrap(await supa.from("positions")
+  .select("id,key,slug,title,brief,active").order("created_at"));
+const loadAllAssignments = async () => unwrap(await supa.from("assignments")
+  .select("id,member_id,position_id"));
+// all-org reviews for stats (admin reads every member's verdicts)
+const loadAllReviews = async () => unwrap(await supa.from("reviews")
+  .select("id,person_id,member_id,position_id,status,status_updated,sourced,created_at")
+  .limit(10000));
+const loadAllStatusEvents = async () => unwrap(await supa.from("status_events")
+  .select("review_id,from_status,to_status,author,created_at").limit(20000));
 
 async function pushFeedback(c, status, noteText) {
   unwrap(await supa.from("reviews")
@@ -296,7 +311,7 @@ function shell(inner) {
     m.className = "menu";
     const admin = state.member && state.member.permission === "admin";
     m.innerHTML = `<div class="who">${esc(state.user.email)}${admin ? " · admin" : ""}</div>
-      ${admin ? `<button id="m-roles">Positions</button>` : ""}
+      ${admin ? `<button id="m-roles">Team</button>` : ""}
       <button id="m-refresh">Refresh</button>
       <button id="m-key">Change key</button>
       <button id="m-out">Sign out</button>`;
@@ -325,58 +340,257 @@ function candidateCard(c, extra = "") {
     </div>`;
 }
 
-/* ---------- roles screen ---------- */
-function renderRoles() {
+/* ---------- admin Team screen (admin only) ---------- */
+const loadAllPeopleNames = async () => unwrap(await supa.from("people").select("id,name").limit(10000));
+async function ensureAdminData(force) {
+  if (state.admin && !force) return;
+  const [members, positions, assignments, reviews, people] = await Promise.all([
+    loadAllMembers(), loadAllPositions(), loadAllAssignments(), loadAllReviews(), loadAllPeopleNames()]);
+  const names = {}; people.forEach(p => names[p.id] = p.name);
+  state.admin = { members, positions, assignments, reviews, names };
+}
+
+async function renderAdmin() {
+  try { await ensureAdminData(); }
+  catch (e) { toast("Couldn't load team data"); state.showRoles = false; return render(); }
+  const { members, positions, assignments } = state.admin;
+  const tab = state.adminTab;
+  const memberName = m => m.name || m.email.split("@")[0];
   shell(`
     <button class="back" id="back">← Back</button>
-    <div class="card setup">
-      <div class="label">Open roles</div>
-      ${state.roles.map(r => `
-        <div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)">
-          <div style="flex:1"><b>${esc(r.key)}</b> — ${esc(r.title)}
-            ${r.brief ? `<div style="color:var(--dim);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.brief)}</div>` : ""}</div>
-          <button class="chip ${r.active ? "on" : ""}" data-toggle="${esc(r.key)}">${r.active ? "active" : "paused"}</button>
-        </div>`).join("")}
-      <div class="label" style="margin-top:20px">Add a role</div>
-      <label>Short code (the badge, e.g. CB)</label>
-      <input id="r-key" type="text" maxlength="6" autocomplete="off">
-      <label>Title</label>
-      <input id="r-title" type="text" placeholder="e.g. Computational Biologist" autocomplete="off">
-      <label>Brief the agent — its starting point for this role</label>
-      <textarea id="r-brief" style="height:130px" placeholder="Paste the JD or braindump: what they'll do here, must-haves, what great looks like, anti-patterns, example people or labs…"></textarea>
-      <button class="save" id="r-add">Add role</button>
-      <p class="hint">Tomorrow morning the agent turns this brief into a full calibration profile (researching the role's talent landscape) <i>before</i> sourcing — so even day one isn't generic. The richer the brief, the better day one is.</p>
-    </div>`);
+    <div class="tabs" style="margin-bottom:12px">
+      ${["positions","members","assign","stats"].map(t =>
+        `<button class="${tab===t?"on":""}" data-atab="${t}" style="font-size:13px;padding:8px 0">${
+          ({positions:"Positions",members:"Members",assign:"Assign",stats:"Stats"})[t]}</button>`).join("")}
+    </div>
+    <div id="abody">${
+      tab==="positions" ? adminPositions(positions) :
+      tab==="members"   ? adminMembers(members) :
+      tab==="assign"    ? adminAssign(members, positions, assignments) :
+                          adminStats()
+    }</div>`);
   $("#back").onclick = () => { state.showRoles = false; render(); };
+  $$("[data-atab]").forEach(b => b.onclick = () => { state.adminTab = b.dataset.atab; render(); });
+  if (tab==="positions") wirePositions();
+  else if (tab==="members") wireMembers();
+  else if (tab==="assign") wireAssign();
+}
+
+/* --- Positions tab --- */
+function adminPositions(positions) {
+  return `<div class="card setup">
+    <div class="label">Open positions</div>
+    ${positions.map(r => `
+      <div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)">
+        <div style="flex:1"><b>${esc(r.key)}</b> — ${esc(r.title)}
+          ${r.brief ? `<div style="color:var(--dim);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.brief)}</div>` : ""}</div>
+        <button class="chip ${r.active ? "on" : ""}" data-toggle="${esc(r.id)}">${r.active ? "active" : "paused"}</button>
+      </div>`).join("")}
+    <div class="label" style="margin-top:20px">Add a position</div>
+    <label>Short code (the badge, e.g. CB)</label>
+    <input id="r-key" type="text" maxlength="6" autocomplete="off">
+    <label>Title</label>
+    <input id="r-title" type="text" placeholder="e.g. Computational Biologist" autocomplete="off">
+    <label>Brief the agent — its starting point for this position</label>
+    <textarea id="r-brief" style="height:120px" placeholder="Paste the JD or braindump: what they'll do here, must-haves, what great looks like, anti-patterns, example people or labs…"></textarea>
+    <button class="save" id="r-add">Add position</button>
+    <p class="hint">The next run turns this brief into a calibration profile before sourcing — the richer the brief, the better day one is. Whoever you assign sources it with their own calibration.</p>
+  </div>`;
+}
+function wirePositions() {
   $$("[data-toggle]").forEach(b => b.onclick = async () => {
-    const r = state.roles.find(x => x.key === b.dataset.toggle);
+    const r = state.admin.positions.find(x => x.id === b.dataset.toggle);
     try {
       unwrap(await supa.from("positions").update({ active: !r.active }).eq("id", r.id));
-      r.active = !r.active;
-      toast(`${r.key} ${r.active ? "active" : "paused"}`);
-      render();
-    } catch (e) { toast("Only admins can change positions"); }
+      r.active = !r.active; toast(`${r.key} ${r.active ? "active" : "paused"}`);
+      state.roles = null; render();
+    } catch (e) { toast("Save failed"); }
   });
   $("#r-add").onclick = async () => {
-    const key = $("#r-key").value.trim().toUpperCase();
-    const title = $("#r-title").value.trim();
-    const brief = $("#r-brief").value.trim();
+    const key = $("#r-key").value.trim().toUpperCase(), title = $("#r-title").value.trim(), brief = $("#r-brief").value.trim();
     if (!key || !title) return toast("Code and title are required");
     if (!brief) return toast("Write a brief — that's what stops blind firing");
-    if (state.roles.some(r => r.key === key)) return toast(`${key} already exists`);
+    if (state.admin.positions.some(r => r.key === key)) return toast(`${key} already exists`);
     const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
     $("#r-add").disabled = true;
     try {
       const row = unwrap(await supa.from("positions")
-        .insert({ org_id: state.member.org_id, key, slug, title, brief, active: true })
-        .select())[0];
-      // assign the creating admin to it so it shows in their queue
-      await supa.from("assignments").insert({ org_id: state.member.org_id, member_id: state.member.id, position_id: row.id, created_by: state.member.id });
-      state.roles.push(row);
-      toast(`${key} added — agent calibrates on its next run`);
-      render();
-    } catch (e) { toast("Only admins can add positions"); $("#r-add").disabled = false; }
+        .insert({ org_id: state.member.org_id, key, slug, title, brief, active: true }).select())[0];
+      state.admin.positions.push(row); toast(`${key} added`); render();
+    } catch (e) { toast("Save failed"); $("#r-add").disabled = false; }
   };
+}
+
+/* --- Members tab --- */
+function adminMembers(members) {
+  return `<div class="card setup">
+    <div class="label">Team</div>
+    ${members.map(m => `
+      <div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)">
+        <div style="flex:1"><b>${esc(m.name || m.email.split("@")[0])}</b>
+          <span style="color:var(--dim);font-size:12px"> ${esc(m.permission)}${m.active?"":" · inactive"}</span>
+          <div style="color:var(--dim);font-size:13px">${esc(m.email)}</div></div>
+        ${m.id === state.member.id ? `<span class="pill s-pending">you</span>`
+          : `<button class="chip ${m.active?"on":""}" data-mtoggle="${esc(m.id)}">${m.active?"active":"off"}</button>`}
+      </div>`).join("")}
+    <div class="label" style="margin-top:20px">Invite a recruiter</div>
+    <label>Work email</label>
+    <input id="m-email" type="email" placeholder="them@anthrogen.com" autocomplete="off">
+    <label>Name (optional)</label>
+    <input id="m-name" type="text" autocomplete="off">
+    <label>Permission</label>
+    <select id="m-perm"><option value="recruiter">recruiter</option><option value="admin">admin</option></select>
+    <button class="save" id="m-add">Invite</button>
+    <p class="hint">They log in with this email (magic link / password). They land on the positions you assign them, with their own fresh calibration. Removing access = toggle them off.</p>
+  </div>`;
+}
+function wireMembers() {
+  $$("[data-mtoggle]").forEach(b => b.onclick = async () => {
+    const m = state.admin.members.find(x => x.id === b.dataset.mtoggle);
+    try {
+      unwrap(await supa.from("members").update({ active: !m.active }).eq("id", m.id));
+      m.active = !m.active; toast(`${m.email.split("@")[0]} ${m.active?"active":"deactivated"}`); render();
+    } catch (e) { toast("Save failed"); }
+  });
+  $("#m-add").onclick = async () => {
+    const email = $("#m-email").value.trim().toLowerCase(), name = $("#m-name").value.trim(), perm = $("#m-perm").value;
+    if (!email || !email.includes("@")) return toast("Enter a valid email");
+    if (state.admin.members.some(m => m.email.toLowerCase() === email)) return toast("Already a member");
+    $("#m-add").disabled = true;
+    try {
+      const row = unwrap(await supa.from("members")
+        .insert({ org_id: state.member.org_id, email, name, permission: perm, active: true }).select())[0];
+      state.admin.members.push(row); toast(`${email.split("@")[0]} invited`); render();
+    } catch (e) { toast("Save failed"); $("#m-add").disabled = false; }
+  };
+}
+
+/* --- Assign tab (member ↔ position) --- */
+function adminAssign(members, positions, assignments) {
+  const has = (mid, pid) => assignments.some(a => a.member_id === mid && a.position_id === pid);
+  const activeMembers = members.filter(m => m.active);
+  const activePositions = positions.filter(p => p.active);
+  return `<div class="card setup">
+    <div class="label">Who sources which position</div>
+    <p style="color:var(--dim);font-size:13px;margin-bottom:8px">Tap a cell to assign/unassign. Each assignment gets its own agent pass and review queue.</p>
+    ${activeMembers.map(m => `
+      <div style="padding:10px 0;border-bottom:1px solid var(--border)">
+        <b>${esc(m.name || m.email.split("@")[0])}</b>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">
+          ${activePositions.map(p => `
+            <button class="chip ${has(m.id,p.id)?"on":""}" data-assign="${esc(m.id)}:${esc(p.id)}">${esc(p.key)}</button>`).join("")}
+        </div>
+      </div>`).join("")}
+  </div>`;
+}
+function wireAssign() {
+  $$("[data-assign]").forEach(b => b.onclick = async () => {
+    const [mid, pid] = b.dataset.assign.split(":");
+    const existing = state.admin.assignments.find(a => a.member_id === mid && a.position_id === pid);
+    try {
+      if (existing) {
+        unwrap(await supa.from("assignments").delete().eq("id", existing.id));
+        state.admin.assignments = state.admin.assignments.filter(a => a.id !== existing.id);
+        toast("Unassigned");
+      } else {
+        const row = unwrap(await supa.from("assignments")
+          .insert({ org_id: state.member.org_id, member_id: mid, position_id: pid, created_by: state.member.id }).select())[0];
+        state.admin.assignments.push(row); toast("Assigned");
+      }
+      render();
+    } catch (e) { toast("Save failed"); }
+  });
+}
+
+/* --- Stats tab: 4 views computed client-side from all-org reviews/events --- */
+const CONTACTED_PLUS = ["contacted","replied","interviewing","offer","hired"];
+function bar(frac, color) {
+  const pct = Math.round((frac || 0) * 100);
+  return `<div style="background:var(--card2);border-radius:6px;height:8px;overflow:hidden;margin-top:3px">
+    <div style="width:${pct}%;height:100%;background:${color}"></div></div>`;
+}
+function adminStats() {
+  const { members, positions, reviews } = state.admin;
+  const mName = id => { const m = members.find(x => x.id === id); return m ? (m.name || m.email.split("@")[0]) : "?"; };
+  const pKey = id => { const p = positions.find(x => x.id === id); return p ? p.key : "?"; };
+  const decided = s => s && s !== "pending" && s !== "watch";
+
+  // (1) per-member yes/no + yes-rate
+  const perMember = members.filter(m => reviews.some(r => r.member_id === m.id)).map(m => {
+    const rs = reviews.filter(r => r.member_id === m.id);
+    const yes = rs.filter(r => ["yes","tracked",...CONTACTED_PLUS].includes(r.status)).length;
+    const no = rs.filter(r => r.status === "no").length;
+    const dec = yes + no;
+    return { name: mName(m.id), total: rs.length, yes, no, rate: dec ? yes/dec : 0, dec };
+  });
+
+  // (2) per-position funnel
+  const perPos = positions.map(p => {
+    const rs = reviews.filter(r => r.position_id === p.id);
+    const c = s => rs.filter(r => r.status === s).length;
+    return { key: p.key, total: rs.length, pending: c("pending")+c("watch"),
+      yes: rs.filter(r=>["yes","tracked"].includes(r.status)).length,
+      contacted: rs.filter(r=>CONTACTED_PLUS.includes(r.status)).length,
+      hired: c("hired") };
+  }).filter(p => p.total);
+
+  // (3) agreement/divergence: people reviewed by >1 member, do verdicts agree?
+  const byPerson = {};
+  reviews.filter(r => decided(r.status)).forEach(r => {
+    (byPerson[r.person_id] = byPerson[r.person_id] || []).push(r);
+  });
+  const norm = s => (["yes","tracked",...CONTACTED_PLUS].includes(s)) ? "yes" : "no";
+  const shared = Object.values(byPerson).filter(rs => new Set(rs.map(r=>r.member_id)).size > 1);
+  const divergent = shared.filter(rs => new Set(rs.map(r=>norm(r.status))).size > 1);
+
+  // (4) throughput: decided verdicts per day (last 14 days) from status_updated
+  const days = {};
+  reviews.filter(r => decided(r.status) && r.status_updated).forEach(r => {
+    const d = r.status_updated.slice(0,10); days[d] = (days[d]||0)+1;
+  });
+  const lastDays = Object.entries(days).sort((a,b)=>a[0].localeCompare(b[0])).slice(-14);
+  const maxDay = Math.max(1, ...lastDays.map(([,n])=>n));
+
+  return `
+    <div class="card" style="margin-bottom:10px">
+      <div class="label">Reviewers — yes-rate</div>
+      ${perMember.map(m => `
+        <div style="margin:10px 0">
+          <div style="display:flex;justify-content:space-between;font-size:14px">
+            <b>${esc(m.name)}</b><span style="color:var(--dim)">${m.yes}✓ ${m.no}✗ · ${m.dec?Math.round(m.rate*100):"–"}% yes · ${m.total} reviewed</span></div>
+          ${bar(m.rate, "var(--yes)")}
+        </div>`).join("") || `<p style="color:var(--dim);font-size:14px">No verdicts yet.</p>`}
+    </div>
+    <div class="card" style="margin-bottom:10px">
+      <div class="label">Pipeline funnel by position</div>
+      ${perPos.map(p => `
+        <div style="margin:10px 0;font-size:14px">
+          <b>${esc(p.key)}</b> <span style="color:var(--dim)">${p.total} sourced</span>
+          <div style="display:flex;gap:4px;margin-top:5px;font-size:12px;color:var(--dim)">
+            <span class="pill s-pending">${p.pending} pending</span>
+            <span class="pill s-yes">${p.yes} yes</span>
+            <span class="pill s-contacted">${p.contacted} contacted</span>
+            <span class="pill s-hired">${p.hired} hired</span>
+          </div>
+        </div>`).join("") || `<p style="color:var(--dim);font-size:14px">No data yet.</p>`}
+    </div>
+    <div class="card" style="margin-bottom:10px">
+      <div class="label">Agreement across reviewers</div>
+      ${shared.length
+        ? `<p style="font-size:14px">${shared.length} ${shared.length===1?"person":"people"} reviewed by more than one teammate · <b style="color:${divergent.length?"var(--maybe)":"var(--yes)"}">${divergent.length} disagreement${divergent.length===1?"":"s"}</b></p>
+           ${divergent.slice(0,8).map(rs => `<div style="font-size:13px;color:var(--dim);margin-top:4px">${esc(personName(rs[0].person_id))}: ${rs.map(r=>`${esc(mName(r.member_id))}→${esc(r.status)}`).join(", ")}</div>`).join("")}`
+        : `<p style="color:var(--dim);font-size:14px">No people reviewed by 2+ teammates yet — divergence shows here once they overlap.</p>`}
+    </div>
+    <div class="card">
+      <div class="label">Throughput — verdicts/day (last 14d)</div>
+      ${lastDays.length ? `<div style="display:flex;align-items:flex-end;gap:3px;height:70px;margin-top:8px">
+        ${lastDays.map(([d,n]) => `<div title="${d}: ${n}" style="flex:1;background:var(--accent);border-radius:3px 3px 0 0;height:${Math.round(n/maxDay*100)}%;min-height:3px"></div>`).join("")}
+      </div><p style="color:var(--dim);font-size:12px;margin-top:4px">${lastDays[0][0]} → ${lastDays[lastDays.length-1][0]}</p>`
+        : `<p style="color:var(--dim);font-size:14px">No dated verdicts yet.</p>`}
+    </div>`;
+}
+function personName(pid) {
+  return (state.admin && state.admin.names && state.admin.names[pid]) || pid;
 }
 
 /* ---------- review tab ---------- */
@@ -628,7 +842,7 @@ function renderDetail() {
 
 /* ---------- boot ---------- */
 function render() {
-  if (state.showRoles) return renderRoles();
+  if (state.showRoles) return renderAdmin();
   state.tab === "review" ? renderReview() : renderTalent();
 }
 let authWired = false;
