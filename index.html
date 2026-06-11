@@ -200,7 +200,7 @@ const loadPool = async () => unwrap(
 // positions the current member is assigned to (their reviewable roles)
 async function loadRoles() {
   const a = unwrap(await supa.from("assignments")
-    .select("positions(key,slug,title,brief,active)")
+    .select("positions(id,key,slug,title,brief,active)")
     .eq("member_id", state.member.id));
   const ps = a.map(x => x.positions).filter(Boolean).filter(p => p.active);
   // admins with no explicit assignment still see all active positions
