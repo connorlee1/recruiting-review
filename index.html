@@ -166,6 +166,10 @@ function flattenReview(r) {
     id: r.id,                          // render code keys off .id
     name: p.name || "",
     affiliation: p.affiliation || "",
+    education: p.education || "",
+    current_role: p.current_role || "",
+    location: p.location || "",
+    experience: p.experience || "",
     evidence: p.evidence || [],
     role: r.positions ? r.positions.key : r.role_key,
     position_id: r.position_id,
@@ -186,7 +190,7 @@ function flattenReview(r) {
 // the all-team admin view is a separate Phase-B stats screen).
 const loadReviews = async () => {
   const rows = unwrap(await supa.from("reviews")
-    .select("*, people(name,affiliation,evidence), positions(key,title), notes(*)")
+    .select("*, people(name,affiliation,education,current_role,location,experience,evidence), positions(key,title), notes(*)")
     .eq("member_id", state.member.id)
     .order("sourced", { ascending: false })
     .order("created_at", { referencedTable: "notes", ascending: true })
@@ -325,11 +329,23 @@ function shell(inner) {
   $("#t-talent").onclick = () => { state.tab = "talent"; state.detail = null; render(); };
 }
 
+function profileRow(label, val) {
+  return val ? `<div style="display:flex;gap:8px;font-size:14px;margin:3px 0">
+    <span style="color:var(--dim);min-width:78px;flex-shrink:0">${esc(label)}</span>
+    <span>${esc(val)}</span></div>` : "";
+}
 function candidateCard(c, extra = "") {
+  const profile = [
+    profileRow("Current", c.current_role),
+    profileRow("Education", c.education),
+    profileRow("Location", c.location),
+    profileRow("Experience", c.experience),
+  ].join("");
   return `
     <div class="card">
       <h2>${esc(c.name)}<span class="badge">${esc(c.role)}</span></h2>
       <div class="sub">${esc(c.affiliation)} · sourced ${esc(c.sourced)}</div>
+      ${profile ? `<div class="section"><div class="label">Profile</div>${profile}</div>` : ""}
       <div class="section"><div class="label">Why them</div><p>${esc(c.why)}</p></div>
       <div class="section evidence"><div class="label">Evidence</div>
         ${(c.evidence || []).map(e => `<a href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.label || e.url)}</a>`).join("") || `<p style="color:var(--dim);font-size:14px">none</p>`}
