@@ -102,6 +102,8 @@
   .save-btn { width: 100%; margin-top: 10px; padding: 12px; background: var(--accent); color: #04121f; font-weight: 700; }
   .slack-btn { width: 100%; margin-top: 12px; padding: 11px; background: #1c2128; border: 1px solid #4A154B; color: #d9a8e0; font-weight: 600; }
   .slack-btn:disabled { opacity: .7; }
+  .wl-btn { margin-top: 12px; padding: 11px; background: #1c2128; border: 1px solid var(--border); color: var(--dim); font-weight: 600; }
+  .wl-btn.on { border-color: var(--maybe); color: var(--maybe); }
 
   .setup label { display: block; font-size: 13px; color: var(--dim); margin: 14px 0 4px; }
   .setup .save { width: 100%; margin-top: 18px; padding: 14px; background: var(--accent); color: #04121f; font-weight: 700; font-size: 16px; }
@@ -183,6 +185,10 @@ function flattenReview(r) {
     status: r.status,
     watch_reason: r.watch_reason || null,
     watch_revisit: r.watch_revisit || null,
+    watchlisted: !!r.watchlisted,
+    last_contact: r.last_contact || null,
+    watch_signal: r.watch_signal || null,
+    watch_signal_at: r.watch_signal_at || null,
     sourced: r.sourced,
     notes: r.notes || [],
   };
@@ -194,6 +200,7 @@ const loadReviews = async () => {
   const rows = unwrap(await supa.from("reviews")
     .select("*, people(name,affiliation,education,role_title,location,experience,evidence), positions(key,title), notes(*)")
     .eq("member_id", state.member.id)
+    // (watchlisted, last_contact, watch_signal, watch_signal_at come via *)
     .order("sourced", { ascending: false })
     .order("created_at", { referencedTable: "notes", ascending: true })
     .limit(2000));
@@ -233,6 +240,20 @@ async function shareToSlack(c) {
   const { data, error } = await supa.functions.invoke("share-to-slack", { body: { review_id: c.review_id } });
   if (error || (data && data.error)) throw new Error((data && data.error) || error.message || "share failed");
   return data;
+}
+
+async function toggleWatchlist(c) {
+  const next = !c.watchlisted;
+  const patch = { watchlisted: next };
+  // first time you watchlist someone, stamp today as last_contact (you can edit later)
+  if (next && !c.last_contact) patch.last_contact = today();
+  unwrap(await supa.from("reviews").update(patch).eq("id", c.review_id));
+  c.watchlisted = next;
+  if (patch.last_contact) c.last_contact = patch.last_contact;
+}
+async function setLastContact(c, date) {
+  unwrap(await supa.from("reviews").update({ last_contact: date || null }).eq("id", c.review_id));
+  c.last_contact = date || null;
 }
 
 async function pushFeedback(c, status, noteText) {
@@ -310,10 +331,13 @@ function renderNotAuthorized() {
 /* ---------- shell ---------- */
 function shell(inner) {
   const pending = state.rows.filter(c => c.status === "pending").length;
+  const wl = state.rows.filter(c => c.watchlisted).length;
+  const wlSignals = state.rows.filter(c => c.watchlisted && c.watch_signal).length;
   app.innerHTML = `
     <header><h1>Anthrogen Talent</h1><button class="gear" id="gear">⚙︎</button></header>
     <div class="tabs">
       <button id="t-review" class="${state.tab === "review" ? "on" : ""}">Review ${pending ? `<span class="count">${pending}</span>` : ""}</button>
+      <button id="t-watch" class="${state.tab === "watch" ? "on" : ""}">Watchlist ${wl ? `<span class="count" style="color:${wlSignals?"#d29922":"var(--dim)"}">${wlSignals ? wlSignals+"🔔" : wl}</span>` : ""}</button>
       <button id="t-talent" class="${state.tab === "talent" ? "on" : ""}">Talent <span class="count" style="color:var(--dim)">${state.rows.length}</span></button>
     </div>
     <div id="body">${inner}</div>`;
@@ -334,6 +358,7 @@ function shell(inner) {
     $("#m-out").onclick = async () => { m.remove(); await supa.auth.signOut(); };
   };
   $("#t-review").onclick = () => { state.tab = "review"; state.detail = null; render(); };
+  $("#t-watch").onclick = () => { state.tab = "watch"; state.detail = null; render(); };
   $("#t-talent").onclick = () => { state.tab = "talent"; state.detail = null; render(); };
 }
 
@@ -361,8 +386,34 @@ function candidateCard(c, extra = "") {
       <div class="section"><div class="label">Recruitability</div><p>${esc(c.recruitability)}</p></div>
       <div class="section"><div class="label">Watch out</div><p class="watch">${esc(c.watch_out)}</p></div>
       ${extra}
-      ${state.slackOn ? `<button class="slack-btn" data-slack="${esc(c.review_id)}">📣 Share to Slack</button>` : ""}
+      ${c.watch_signal ? `<div class="section"><div class="label" style="color:var(--maybe)">🔔 Movement signal</div><p class="watch">${esc(c.watch_signal)}${c.watch_signal_at ? ` <span style="color:var(--dim);font-size:12px">· ${esc(String(c.watch_signal_at).slice(0,10))}</span>` : ""}</p></div>` : ""}
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="wl-btn ${c.watchlisted ? "on" : ""}" data-wl="${esc(c.review_id)}" style="flex:1">${c.watchlisted ? "👁 On watchlist" : "👁 Add to watchlist"}</button>
+        ${state.slackOn ? `<button class="slack-btn" data-slack="${esc(c.review_id)}" style="flex:1;margin-top:0">📣 Slack</button>` : ""}
+      </div>
+      ${c.watchlisted ? `<div style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:13px;color:var(--dim)">Last contact: <input type="date" data-lc="${esc(c.review_id)}" value="${esc(c.last_contact || "")}" style="width:auto;padding:6px 8px;font-size:13px"></div>` : ""}
     </div>`;
+}
+
+// wire watchlist toggle + last-contact date on any card currently on screen
+function wireWatchlist() {
+  $$("[data-wl]").forEach(b => b.onclick = async () => {
+    const c = findRow(b.dataset.wl);
+    if (!c) return;
+    b.disabled = true;
+    try { await toggleWatchlist(c); render(); }
+    catch (e) { b.disabled = false; toast("Save failed"); }
+  });
+  $$("[data-lc]").forEach(inp => inp.onchange = async () => {
+    const c = findRow(inp.dataset.lc);
+    if (!c) return;
+    try { await setLastContact(c, inp.value); toast("Updated"); }
+    catch (e) { toast("Save failed"); }
+  });
+}
+// look up a flattened row by review_id across loaded data
+function findRow(rid) {
+  return (state.rows || []).find(r => r.review_id === rid);
 }
 
 // wire any Share-to-Slack buttons currently on screen (call after each render)
@@ -789,6 +840,31 @@ function renderReview() {
   });
 }
 
+/* ---------- watchlist tab ---------- */
+function renderWatch() {
+  if (state.detail) return renderDetail();
+  const list = state.rows.filter(c => c.watchlisted)
+    // people with a fresh movement signal float to the top
+    .sort((a, b) => {
+      if (!!b.watch_signal !== !!a.watch_signal) return b.watch_signal ? 1 : -1;
+      return (b.watch_signal_at || b.last_contact || "").localeCompare(a.watch_signal_at || a.last_contact || "");
+    });
+  const signals = list.filter(c => c.watch_signal);
+  shell(`
+    <div class="empty" style="padding:18px 8px 6px">
+      <p style="color:var(--dim);font-size:14px">People you're tracking. The daily agent watches each for movement signals — graduating, leaving a lab, a job change — and flags when they're worth re-engaging.</p>
+    </div>
+    ${signals.length ? `<div class="label" style="color:var(--maybe);margin:8px 2px">🔔 ${signals.length} worth re-engaging</div>` : ""}
+    ${list.map(c => `
+      <button class="row" data-id="${esc(c.review_id)}" style="${c.watch_signal ? "border-color:var(--maybe)" : ""}">
+        <div class="who"><b>${esc(c.name)} <span style="color:var(--accent);font-size:12px">${esc(c.role)}</span></b>
+          <span>${c.watch_signal ? `🔔 ${esc(c.watch_signal)}` : (c.affiliation || "")}${c.last_contact ? ` · last contact ${esc(c.last_contact)}` : ""}</span></div>
+        <span class="pill s-${esc(c.status)}">${esc(c.status)}</span>
+      </button>`).join("") ||
+      `<div class="empty"><div class="big">👁</div><h2>No one on the watchlist yet</h2><p>Open any candidate and tap “Add to watchlist” to start tracking people you've reached out to or want to keep warm.</p></div>`}`);
+  $$(".row[data-id]").forEach(r => r.onclick = () => { state.detail = r.dataset.id; render(); });
+}
+
 /* ---------- talent tab ---------- */
 function renderTalent() {
   if (state.detail) return renderDetail();
@@ -916,7 +992,10 @@ function renderDetail() {
 /* ---------- boot ---------- */
 function render() {
   if (state.showRoles) return renderAdmin();
-  if (state.tab === "review") renderReview(); else renderTalent();
+  if (state.tab === "review") renderReview();
+  else if (state.tab === "watch") renderWatch();
+  else renderTalent();
+  wireWatchlist();                  // wire watchlist toggles / date inputs
   if (state.slackOn) wireSlack();   // wire any Share buttons the screen drew
 }
 let authWired = false;
