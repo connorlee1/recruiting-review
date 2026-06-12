@@ -141,7 +141,8 @@ const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const app = $("#app");
 const state = { rows: null, tab: "review", reviewed: 0, reviewRole: null, search: "", filter: "all", roleFilter: "all", detail: null, pool: null, includePool: false, user: null, member: null, roles: [], showRoles: false,
-  adminTab: "positions", admin: null, slackOn: false, showTaste: false, taste: null };  // admin lazy-loaded; slackOn = Slack configured; taste = member's profile
+  adminTab: "positions", admin: null, slackOn: false, showTaste: false, taste: null,
+  runlog: [], myAssignments: [], showRuns: false };  // runlog = recent run outcomes; myAssignments carry broaden_requested
 let supa = null;
 
 const anonKey = () => SUPA_ANON_KEY || localStorage.getItem("sb_anon") || "";
@@ -189,6 +190,7 @@ function flattenReview(r) {
     last_contact: r.last_contact || null,
     watch_signal: r.watch_signal || null,
     watch_signal_at: r.watch_signal_at || null,
+    exploratory: !!r.exploratory,
     sourced: r.sourced,
     notes: r.notes || [],
   };
@@ -210,6 +212,15 @@ const loadPool = async () => unwrap(
   await supa.from("pool").select("*")
     .eq("member_id", state.member.id)
     .order("evaluated", { ascending: false }).limit(2000));
+// recent per-(member,position) run outcomes — powers the empty-run banner + history
+const loadRunLog = async () => unwrap(await supa.from("run_log")
+  .select("position_id,run_date,mode,contact_now,keep_warm,pooled,summary,created_at")
+  .eq("member_id", state.member.id)
+  .order("created_at", { ascending: false }).limit(60));
+// the member's own assignment rows (carry broaden_requested)
+const loadMyAssignments = async () => unwrap(await supa.from("assignments")
+  .select("id,position_id,broaden_requested").eq("member_id", state.member.id));
+
 // positions the current member is assigned to (their reviewable roles)
 async function loadRoles() {
   const a = unwrap(await supa.from("assignments")
@@ -254,6 +265,20 @@ async function toggleWatchlist(c) {
 async function setLastContact(c, date) {
   unwrap(await supa.from("reviews").update({ last_contact: date || null }).eq("id", c.review_id));
   c.last_contact = date || null;
+}
+// helpers for run-log / broaden
+function latestRun(positionId) {
+  return (state.runlog || []).find(r => r.position_id === positionId) || null;
+}
+function broadenPending(positionId) {
+  const a = (state.myAssignments || []).find(x => x.position_id === positionId);
+  return !!(a && a.broaden_requested);
+}
+async function requestBroaden(positionId) {
+  const a = (state.myAssignments || []).find(x => x.position_id === positionId);
+  if (!a) throw new Error("no assignment");
+  unwrap(await supa.from("assignments").update({ broaden_requested: true }).eq("id", a.id));
+  a.broaden_requested = true;
 }
 
 async function pushFeedback(c, status, noteText) {
@@ -348,12 +373,14 @@ function shell(inner) {
     const admin = state.member && state.member.permission === "admin";
     m.innerHTML = `<div class="who">${esc(state.user.email)}${admin ? " · admin" : ""}</div>
       <button id="m-taste">My taste profile</button>
+      <button id="m-runs">Run history</button>
       ${admin ? `<button id="m-roles">Team</button>` : ""}
       <button id="m-refresh">Refresh</button>
       <button id="m-key">Change key</button>
       <button id="m-out">Sign out</button>`;
     document.body.appendChild(m);
     $("#m-taste").onclick = () => { m.remove(); state.showTaste = true; render(); };
+    $("#m-runs").onclick = () => { m.remove(); state.showRuns = true; render(); };
     if (admin) $("#m-roles").onclick = () => { m.remove(); state.showRoles = true; render(); };
     $("#m-refresh").onclick = () => { m.remove(); boot(); };
     $("#m-key").onclick = () => { m.remove(); renderKeySetup(); };
@@ -378,6 +405,7 @@ function candidateCard(c, extra = "") {
   ].join("");
   return `
     <div class="card">
+      ${c.exploratory ? `<div style="background:rgba(88,166,255,.12);border:1px solid var(--accent);color:var(--accent);border-radius:8px;padding:7px 10px;font-size:13px;margin-bottom:10px">🔭 Exploratory — surfaced by a broadened search, lower confidence. Your verdict tells the agent if it over-narrowed.</div>` : ""}
       <h2>${esc(c.name)}<span class="badge">${esc(c.role)}</span></h2>
       <div class="sub">${esc(c.affiliation)} · sourced ${esc(c.sourced)}</div>
       ${profile ? `<div class="section"><div class="label">Profile</div>${profile}</div>` : ""}
@@ -492,7 +520,28 @@ async function renderTaste() {
 // a lightweight shell wrapper for full-screen sub-views (no tab bar)
 function shell2(inner) {
   app.innerHTML = `<header><h1>Anthrogen Talent</h1><button class="gear" id="gear2">⚙︎</button></header>${inner}`;
-  $("#gear2").onclick = () => { state.showTaste = false; render(); };
+  $("#gear2").onclick = () => { state.showTaste = false; state.showRuns = false; render(); };
+}
+
+/* ---------- run history (per (member,position) outcomes) ---------- */
+function renderRuns() {
+  const posName = id => { const p = (state.roles || []).find(x => x.id === id); return p ? p.key : "?"; };
+  const rows = (state.runlog || []);
+  shell2(`
+    <button class="back" id="back">← Back</button>
+    <div class="empty" style="padding:14px 8px 4px"><div class="big">📜</div>
+      <h2>Run history</h2>
+      <p style="color:var(--dim);font-size:14px">What each daily run produced and why — including the days it deliberately surfaced no one.</p></div>
+    ${rows.length ? rows.map(r => `
+      <div class="card" style="margin-bottom:8px;padding:12px 14px">
+        <div style="display:flex;justify-content:space-between;align-items:baseline">
+          <b>${esc(posName(r.position_id))} <span style="color:var(--dim);font-size:12px;font-weight:400">${esc(r.run_date)}${r.mode==="broadened"?" · 🔭 broadened":""}</span></b>
+          <span style="font-size:12px;color:var(--dim)">${r.contact_now}▸ ${r.keep_warm}🔥 ${r.pooled}⊘</span>
+        </div>
+        ${r.summary ? `<div style="font-size:14px;color:var(--text);margin-top:5px">${esc(r.summary)}</div>` : ""}
+      </div>`).join("")
+      : `<div class="empty"><div class="big">—</div><h2>No runs recorded yet</h2><p>Run history appears here after the daily agent runs (needs migration 010 applied).</p></div>`}`);
+  $("#back").onclick = () => { state.showRuns = false; render(); };
 }
 
 /* ---------- admin Team screen (admin only) ---------- */
@@ -807,11 +856,30 @@ function renderReview() {
   const orphan = inReview.filter(c => !state.roles.some(r => r.key === c.role)).length;
 
   if (!inReview.length) {
-    shell(`<div class="empty"><div class="big">${state.reviewed ? "✅" : "📭"}</div>
-      <h2>${state.reviewed ? "All done" : "Queue is clear"}</h2>
+    // per assigned position, show the latest run's reason + a Broaden button
+    const cards = (state.roles || []).map(r => {
+      const run = latestRun(r.id);
+      const pending = broadenPending(r.id);
+      const line = run
+        ? `<div style="color:var(--dim);font-size:13px;margin-top:4px">${run.mode === "broadened" ? "🔭 " : ""}${esc(run.summary || `${run.contact_now} contact-now, ${run.pooled} pooled`)}<br><span style="font-size:12px">last run ${esc(run.run_date)}</span></div>`
+        : `<div style="color:var(--dim);font-size:13px;margin-top:4px">No run recorded yet.</div>`;
+      return `<div class="card" style="margin-bottom:10px">
+        <b>${esc(r.title)}</b> <span style="color:var(--dim);font-size:13px">· nothing to review</span>
+        ${line}
+        <button class="wl-btn ${pending ? "on" : ""}" data-broaden="${esc(r.id)}" style="width:100%;margin-top:10px" ${pending ? "disabled" : ""}>${pending ? "🔭 Broaden requested — runs next pass" : "🔭 Broaden search (wide net, lower bar)"}</button>
+      </div>`;
+    }).join("");
+    shell(`<div class="empty" style="padding:24px 8px 8px"><div class="big">${state.reviewed ? "✅" : "📭"}</div>
+      <h2>${state.reviewed ? "All caught up" : "Queue is clear"}</h2>
       <p>${state.reviewed
         ? `${state.reviewed} verdict${state.reviewed > 1 ? "s" : ""} saved — tomorrow's run learns from them.`
-        : "No pending candidates. New ones land each morning."}</p></div>`);
+        : "Each run records why it surfaced who it did — including when it deliberately surfaced no one."}</p></div>
+      ${cards}`);
+    $$("[data-broaden]").forEach(b => b.onclick = async () => {
+      b.disabled = true;
+      try { await requestBroaden(b.dataset.broaden); toast("Broadened pass requested for next run"); render(); }
+      catch (e) { b.disabled = false; toast("Couldn't request — try refresh"); }
+    });
     state.reviewRole = null;
     return;
   }
@@ -1058,6 +1126,7 @@ function renderDetail() {
 /* ---------- boot ---------- */
 function render() {
   if (state.showTaste) return renderTaste();
+  if (state.showRuns) return renderRuns();
   if (state.showRoles) return renderAdmin();
   if (state.tab === "review") renderReview();
   else if (state.tab === "watch") renderWatch();
@@ -1092,6 +1161,9 @@ async function boot() {
     state.member = members[0];
     [state.rows, state.roles] = await Promise.all([loadReviews(), loadRoles()]);
     try { state.slackOn = !!unwrap(await supa.rpc("slack_configured")); } catch (e) { state.slackOn = false; }
+    // run-log + assignments are optional (migration 010); don't block boot if absent
+    try { [state.runlog, state.myAssignments] = await Promise.all([loadRunLog(), loadMyAssignments()]); }
+    catch (e) { state.runlog = []; state.myAssignments = []; }
     render();
   } catch (e) {
     if (String(e.message || "").includes("Invalid API key")) renderKeySetup("That key was rejected — paste the publishable/anon key.");
