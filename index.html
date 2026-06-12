@@ -343,6 +343,54 @@ function renderLogin(msg = "", isErr = false) {
   };
 }
 
+/* ---------- required notifications onboarding ---------- */
+async function sendTest(memberId, phone, slackId) {
+  const { data, error } = await supa.functions.invoke("send-notifications", {
+    body: { member_id: memberId, text: "✅ Anthrogen Talent notifications are set up — you'll get your daily candidate digest here.", phone, slack_user_id: slackId },
+  });
+  if (error) throw new Error(error.message || "send failed");
+  return data; // { slack: 'sent'|..., sms: 'sent'|... }
+}
+function renderOnboarding(fromSettings) {
+  app.innerHTML = `
+    <header><h1>Anthrogen Talent</h1></header>
+    <div class="card setup">
+      ${fromSettings ? `<button class="back" id="ob-back">← Back</button>` : ""}
+      <div class="big" style="font-size:40px;text-align:center">🔔</div>
+      <h2 style="text-align:center;font-size:18px">${fromSettings ? "Notifications" : "Set up your notifications"}</h2>
+      <p style="font-size:14px;color:var(--dim)">Your daily candidate finds are delivered to you personally.${fromSettings ? "" : " Set this up once to start using the app. (Required.)"}</p>
+      <label>Mobile number (for SMS digests)</label>
+      <input id="ob-phone" type="tel" placeholder="+1 415 555 0142" value="${esc(state.member.phone || "")}" autocomplete="tel">
+      <label>Slack member ID (for DM digests)</label>
+      <input id="ob-slack" type="text" placeholder="U086… (Slack → your profile → ⋯ → Copy member ID)" value="${esc(state.member.slack_user_id || "")}" autocomplete="off">
+      <button class="alt" id="ob-test" style="margin-top:12px">Send me a test</button>
+      <div class="ok" id="ob-result"></div>
+      <button class="save" id="ob-finish">${fromSettings ? "Save" : "Finish &amp; enter app"}</button>
+      <p class="hint">SMS needs your number in <b>+countrycode</b> format. Slack DMs need your member ID (in Slack: click your avatar → Profile → ⋯ → <i>Copy member ID</i>). At least one channel is required; both is best. Edit anytime under ⚙︎ → Notifications.</p>
+    </div>`;
+  if (fromSettings) $("#ob-back").onclick = () => render();
+  $("#ob-test").onclick = async () => {
+    const phone = $("#ob-phone").value.trim(), slack = $("#ob-slack").value.trim();
+    if (!phone && !slack) return toast("Enter a phone or Slack ID first");
+    $("#ob-test").disabled = true; $("#ob-result").textContent = "Sending…";
+    try {
+      const r = await sendTest(state.member.id, phone, slack);
+      $("#ob-result").innerHTML = `Slack: <b>${esc(r.slack)}</b> · SMS: <b>${esc(r.sms)}</b>`;
+    } catch (e) { $("#ob-result").innerHTML = `<span style="color:#ff7b72">${esc(e.message)}</span>`; }
+    $("#ob-test").disabled = false;
+  };
+  $("#ob-finish").onclick = async () => {
+    const phone = $("#ob-phone").value.trim(), slack = $("#ob-slack").value.trim();
+    if (!phone && !slack) return toast("Add at least one: phone or Slack ID");
+    $("#ob-finish").disabled = true;
+    try {
+      unwrap(await supa.rpc("update_my_contact", { p_phone: phone || null, p_slack: slack || null, p_onboarded: true }));
+      state.member.phone = phone; state.member.slack_user_id = slack; state.member.onboarded = true;
+      toast("All set"); fromSettings ? render() : boot();
+    } catch (e) { toast("Save failed — try again"); $("#ob-finish").disabled = false; }
+  };
+}
+
 function renderNotAuthorized() {
   app.innerHTML = `
     <header><h1>Anthrogen Talent</h1></header>
@@ -373,6 +421,7 @@ function shell(inner) {
     const admin = state.member && state.member.permission === "admin";
     m.innerHTML = `<div class="who">${esc(state.user.email)}${admin ? " · admin" : ""}</div>
       <button id="m-taste">My taste profile</button>
+      <button id="m-notif">Notifications</button>
       <button id="m-runs">Run history</button>
       ${admin ? `<button id="m-roles">Team</button>` : ""}
       <button id="m-refresh">Refresh</button>
@@ -380,6 +429,7 @@ function shell(inner) {
       <button id="m-out">Sign out</button>`;
     document.body.appendChild(m);
     $("#m-taste").onclick = () => { m.remove(); state.showTaste = true; render(); };
+    $("#m-notif").onclick = () => { m.remove(); state.member.onboarded = true; renderOnboarding(true); };
     $("#m-runs").onclick = () => { m.remove(); state.showRuns = true; render(); };
     if (admin) $("#m-roles").onclick = () => { m.remove(); state.showRoles = true; render(); };
     $("#m-refresh").onclick = () => { m.remove(); boot(); };
@@ -593,25 +643,50 @@ function adminSlack() {
     <input id="sl-hint" type="text" placeholder="#recruiting" autocomplete="off">
     <label>Signing secret (enables the “Mark contacted” button)</label>
     <input id="sl-sign" type="password" placeholder="Slack app → Basic Information → Signing Secret" autocomplete="off">
-    <button class="save" id="sl-save">Save</button>
-    <p class="hint">Webhook: <a href="https://api.slack.com/messaging/webhooks" target="_blank">api.slack.com → Incoming Webhooks</a>. Signing secret (for interactive buttons): your Slack app → Basic Information → App Credentials → Signing Secret, and set Interactivity → Request URL to the slack-interactivity function. ${state.slackOn ? "<b style='color:#3fb950'>Webhook configured.</b>" : ""}</p>
+    <label>Bot token (enables per-person Slack DMs)</label>
+    <input id="sl-bot" type="password" placeholder="xoxb-… (OAuth & Permissions → Bot User OAuth Token)" autocomplete="off">
+    <button class="save" id="sl-save">Save Slack</button>
+    <p class="hint">Webhook + signing secret as before. Bot token (for DM digests): add <code>chat:postMessage</code> scope, install/reinstall, copy the <b>Bot User OAuth Token</b>. ${state.slackOn ? "<b style='color:#3fb950'>Webhook configured.</b>" : ""}</p>
+    <div class="label" style="margin-top:22px">Twilio — SMS digests</div>
+    <label>Account SID</label>
+    <input id="tw-sid" type="text" placeholder="AC…" autocomplete="off">
+    <label>Auth token</label>
+    <input id="tw-tok" type="password" placeholder="Twilio auth token" autocomplete="off">
+    <label>From number</label>
+    <input id="tw-from" type="tel" placeholder="+1…" autocomplete="off">
+    <button class="save" id="tw-save">Save Twilio</button>
+    <p class="hint">From <a href="https://console.twilio.com" target="_blank">console.twilio.com</a>: Account SID + Auth Token, and a phone number you've bought. Trial accounts can only text verified numbers until upgraded.</p>
   </div>`;
 }
 function wireSlackAdmin() {
-  $("#sl-save").onclick = async () => {
-    const u = $("#sl-url").value.trim(), hint = $("#sl-hint").value.trim(), sign = $("#sl-sign").value.trim();
-    if (u && !u.startsWith("https://hooks.slack.com/")) return toast("That doesn't look like a Slack webhook URL");
-    $("#sl-save").disabled = true;
+  const upsert = async (fields, btn, okMsg) => {
+    btn.disabled = true;
     try {
-      // only send fields the admin actually filled (so re-saving one doesn't wipe the other)
-      const row = { org_id: state.member.org_id, slack_channel_hint: hint, updated_at: new Date().toISOString() };
-      if (u) row.slack_webhook_url = u;
-      if (sign) row.slack_signing_secret = sign;
-      unwrap(await supa.from("integrations").upsert(row, { onConflict: "org_id" }));
-      if (u) state.slackOn = true;
-      toast("Slack settings saved");
-      render();
-    } catch (e) { toast("Save failed — admin only"); $("#sl-save").disabled = false; }
+      unwrap(await supa.from("integrations").upsert(
+        { org_id: state.member.org_id, updated_at: new Date().toISOString(), ...fields },
+        { onConflict: "org_id" }));
+      toast(okMsg); btn.disabled = false;
+    } catch (e) { toast("Save failed — admin only"); btn.disabled = false; }
+  };
+  $("#sl-save").onclick = async () => {
+    const u = $("#sl-url").value.trim(), hint = $("#sl-hint").value.trim(),
+          sign = $("#sl-sign").value.trim(), bot = $("#sl-bot").value.trim();
+    if (u && !u.startsWith("https://hooks.slack.com/")) return toast("That doesn't look like a Slack webhook URL");
+    const f = { slack_channel_hint: hint };
+    if (u) f.slack_webhook_url = u;
+    if (sign) f.slack_signing_secret = sign;
+    if (bot) f.slack_bot_token = bot;
+    await upsert(f, $("#sl-save"), "Slack saved");
+    if (u) state.slackOn = true;
+  };
+  $("#tw-save").onclick = async () => {
+    const sid = $("#tw-sid").value.trim(), tok = $("#tw-tok").value.trim(), from = $("#tw-from").value.trim();
+    const f = {};
+    if (sid) f.twilio_account_sid = sid;
+    if (tok) f.twilio_auth_token = tok;
+    if (from) f.twilio_from = from;
+    if (!Object.keys(f).length) return toast("Fill in the Twilio fields");
+    await upsert(f, $("#tw-save"), "Twilio saved");
   };
 }
 
@@ -1155,10 +1230,12 @@ async function boot() {
     // resolve the logged-in email to a member row (org + permission). RLS already
     // scopes this to the caller's org; a non-member sees zero rows → not authorized.
     const members = unwrap(await supa.from("members")
-      .select("id,org_id,email,name,permission,active")
+      .select("id,org_id,email,name,permission,active,phone,slack_user_id,onboarded")
       .ilike("email", state.user.email).eq("active", true));
     if (!members.length) return renderNotAuthorized();
     state.member = members[0];
+    // required onboarding gate: must set up notifications before using the app
+    if (!state.member.onboarded) return renderOnboarding();
     [state.rows, state.roles] = await Promise.all([loadReviews(), loadRoles()]);
     try { state.slackOn = !!unwrap(await supa.rpc("slack_configured")); } catch (e) { state.slackOn = false; }
     // run-log + assignments are optional (migration 010); don't block boot if absent
